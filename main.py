@@ -1,0 +1,241 @@
+"""main.py — Unified entry point for the Mini Xiangqi project.
+
+Subcommands:
+
+    python main.py play        # open the pygame GUI (human vs AI by default)
+    python main.py search      # let alpha-beta pick a move from the start
+    python main.py mcts        # let MCTS pick a move from the start
+    python main.py selfplay    # generate self-play games (MCTS + network)
+    python main.py train       # run the full AlphaZero training loop
+    python main.py api         # start the FastAPI server
+    python main.py viz         # render a board position to PNG
+    python main.py test        # run the unittest suite
+
+The CLI has no required third-party dependencies for ``search`` / ``test``;
+``play`` needs pygame, ``train`` needs torch, ``api`` needs fastapi.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import unittest
+
+
+def cmd_play(args) -> int:
+    from gui.pygame_gui import run, GameMode, Difficulty
+    from engine.piece import Color
+
+    mode = GameMode.HUMAN_VS_HUMAN if args.mode == "hvh" else GameMode.HUMAN_VS_AI
+    difficulty_map = {
+        "easy": Difficulty.EASY,
+        "medium": Difficulty.MEDIUM,
+        "hard": Difficulty.HARD,
+        "expert": Difficulty.EXPERT,
+    }
+    difficulty = difficulty_map.get(args.difficulty, Difficulty.MEDIUM)
+
+    # If --color is explicitly given, skip the selection screen.
+    if args.color is not None:
+        human_color = Color.RED if args.color == "red" else Color.BLACK
+        run(mode=mode, difficulty=difficulty, human_color=human_color, choose_color=False)
+    else:
+        # Let the GUI show the color selection screen (HvAI mode).
+        run(mode=mode, difficulty=difficulty, choose_color=True)
+    return 0
+
+
+def cmd_search(args) -> int:
+    from engine.board import Board
+    from search.alphabeta import alphabeta
+
+    board = Board()
+    if args.fen:
+        board = Board.from_fen(args.fen)
+    print(board)
+    score, move = alphabeta(board, depth=args.depth)
+    print(f"\nalpha-beta (depth {args.depth}) -> {move}  score={score:+.2f}")
+    return 0
+
+
+def cmd_mcts(args) -> int:
+    from engine.board import Board
+    from search.mcts import MCTS
+    from nn.network import default_net
+
+    board = Board()
+    if args.fen:
+        board = Board.from_fen(args.fen)
+    print(board)
+
+    net = default_net()
+    mcts = MCTS(num_simulations=args.simulations)
+    probs, best = mcts.search(board, net)
+
+    print(f"\nMCTS ({args.simulations} sims) -> {best}")
+    print("Top moves by visit count:")
+    sorted_moves = sorted(probs.items(), key=lambda x: -x[1])[:5]
+    for mv, prob in sorted_moves:
+        print(f"  {mv.uci():6s}  {prob:.3f}")
+    return 0
+
+
+def cmd_selfplay(args) -> int:
+    from nn.network import default_net, RandomPolicyValueNet
+    from nn.dataset import SelfPlayDataset
+    from selfplay.player import generate_games
+    from search.mcts import MCTS
+
+    net = default_net() if args.use_net else RandomPolicyValueNet(seed=args.seed)
+    mcts = MCTS(num_simulations=args.simulations) if args.simulations > 0 else None
+
+    dataset = SelfPlayDataset(args.data)
+    outcomes = generate_games(
+        dataset,
+        n_games=args.games,
+        net=net,
+        mcts=mcts,
+        seed=args.seed,
+        max_plies=args.max_plies,
+        temperature=args.temperature,
+    )
+    red = sum(1 for o in outcomes if o > 0)
+    black = sum(1 for o in outcomes if o < 0)
+    draws = len(outcomes) - red - black
+    print(f"played {len(outcomes)} games: red={red} black={black} draw={draws}")
+    print(f"stored {dataset.num_games()} games in {args.data}")
+    return 0
+
+
+def cmd_train(args) -> int:
+    from train.trainer import Trainer
+
+    trainer = Trainer()
+    trainer.train(
+        iterations=args.iterations,
+        games_per_iter=args.games,
+        epochs_per_iter=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
+    return 0
+
+
+def cmd_api(args) -> int:
+    from api.server import run as run_server
+    run_server(host=args.host, port=args.port)
+    return 0
+
+
+def cmd_viz(args) -> int:
+    from engine.board import Board
+    from engine.move import Move
+    from gui.matplotlib_viz import render
+
+    board = Board()
+    last_move = None
+    if args.fen:
+        board = Board.from_fen(args.fen)
+    elif args.moves:
+        for uci in args.moves:
+            mv = Move.from_uci(uci)
+            last_move = mv
+            board.make_move(mv)
+
+    title = args.title or (
+        f"FEN: {args.fen}" if args.fen else
+        (f"after moves: {' '.join(args.moves)}" if args.moves else "start position")
+    )
+    render(board, last_move=last_move, title=title, save_path=args.out)
+    print(f"rendered -> {args.out}")
+    return 0
+
+
+def cmd_test(_args) -> int:
+    loader = unittest.TestLoader()
+    suite = loader.discover(start_dir="tests", pattern="test_*.py")
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Mini Xiangqi (迷你象棋) — 7x7 Chinese Chess AI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # --- play ---
+    p_play = sub.add_parser("play", help="open the pygame GUI")
+    p_play.add_argument("--mode", choices=["hvh", "hvai"], default="hvai",
+                        help="hvh = human vs human, hvai = human vs AI")
+    p_play.add_argument("--difficulty", choices=["easy", "medium", "hard", "expert"],
+                        default="medium")
+    p_play.add_argument("--color", choices=["red", "black"], default=None,
+                        help="which side the human plays (vs AI mode); omit to choose in GUI")
+
+    # --- search ---
+    p_search = sub.add_parser("search", help="alpha-beta move from a position")
+    p_search.add_argument("--depth", type=int, default=3)
+    p_search.add_argument("--fen", default=None, help="FEN (default: start)")
+
+    # --- mcts ---
+    p_mcts = sub.add_parser("mcts", help="MCTS move from a position")
+    p_mcts.add_argument("--simulations", type=int, default=400)
+    p_mcts.add_argument("--fen", default=None, help="FEN (default: start)")
+
+    # --- selfplay ---
+    p_sp = sub.add_parser("selfplay", help="generate self-play games")
+    p_sp.add_argument("--games", type=int, default=5)
+    p_sp.add_argument("--max-plies", type=int, default=200)
+    p_sp.add_argument("--data", default="data/games/games.jsonl")
+    p_sp.add_argument("--seed", type=int, default=0)
+    p_sp.add_argument("--simulations", type=int, default=0,
+                      help="MCTS simulations per move (0 = pure network policy)")
+    p_sp.add_argument("--temperature", type=float, default=1.0)
+    p_sp.add_argument("--use-net", action="store_true",
+                      help="use the trained network (if available)")
+
+    # --- train ---
+    p_train = sub.add_parser("train", help="run the AlphaZero training loop")
+    p_train.add_argument("--iterations", type=int, default=10)
+    p_train.add_argument("--games", type=int, default=20,
+                         help="self-play games per iteration")
+    p_train.add_argument("--epochs", type=int, default=5,
+                         help="training epochs per iteration")
+    p_train.add_argument("--batch-size", type=int, default=64)
+    p_train.add_argument("--lr", type=float, default=1e-3)
+
+    # --- api ---
+    p_api = sub.add_parser("api", help="start the FastAPI server")
+    p_api.add_argument("--host", default="127.0.0.1")
+    p_api.add_argument("--port", type=int, default=8000)
+
+    # --- viz ---
+    p_viz = sub.add_parser("viz", help="render a board position to PNG")
+    src = p_viz.add_mutually_exclusive_group()
+    src.add_argument("--fen", help="FEN string to render")
+    src.add_argument("--moves", nargs="+", help="UCI moves from start")
+    p_viz.add_argument("--out", default="board.png", help="output PNG path")
+    p_viz.add_argument("--title", default=None)
+
+    # --- test ---
+    sub.add_parser("test", help="run the unittest suite")
+
+    args = parser.parse_args()
+    handlers = {
+        "play": cmd_play,
+        "search": cmd_search,
+        "mcts": cmd_mcts,
+        "selfplay": cmd_selfplay,
+        "train": cmd_train,
+        "api": cmd_api,
+        "viz": cmd_viz,
+        "test": cmd_test,
+    }
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

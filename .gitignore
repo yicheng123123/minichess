@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Unrelated scripts
+*.ps1
+
+# Project data (large/generated)
+data/games/*.jsonl
+data/replay/*
+data/weights/*
+models/*.pt
+
+# Keep directory structure
+!data/**/.gitkeep
+!models/.gitkeep
