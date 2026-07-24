@@ -159,6 +159,75 @@ def cmd_viz(args) -> int:
     return 0
 
 
+def cmd_compare(args) -> int:
+    """Compare two checkpoints by playing them against each other."""
+    import torch
+    from nn.network import create_network
+    from search.mcts import MCTS
+    from engine.board import Board
+    from engine.rules import game_result, GameOutcome
+    from utils.config import get_config
+
+    cfg = get_config()
+
+    def load_net(path):
+        net = create_network(hidden=cfg.hidden_channels, num_res_blocks=cfg.num_res_blocks)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if "state_dict" in payload:
+            net.load_state_dict(payload["state_dict"])
+        else:
+            net.load_state_dict(payload)
+        net.eval()
+        return net
+
+    net_a = load_net(args.model_a)
+    net_b = load_net(args.model_b)
+    mcts_a = MCTS(num_simulations=args.simulations, add_noise=False)
+    mcts_b = MCTS(num_simulations=args.simulations, add_noise=False)
+
+    print(f"Comparing: {args.model_a} (Red) vs {args.model_b} (Black)")
+    print(f"Games: {args.games}, Simulations: {args.simulations}")
+    print("-" * 50)
+
+    wins_a, wins_b, draws = 0, 0, 0
+    for i in range(args.games):
+        board = Board()
+        ply = 0
+        while ply < 150:
+            result = game_result(board)
+            if result is not None:
+                break
+            if board.side_to_move.value == "red":
+                _, move = mcts_a.search(board, net_a)
+            else:
+                _, move = mcts_b.search(board, net_b)
+            board.make_move(move)
+            ply += 1
+
+        result = game_result(board)
+        if result is None:
+            draws += 1
+            outcome = "Draw"
+        elif result.outcome == GameOutcome.RED_WINS:
+            wins_a += 1
+            outcome = "A wins"
+        else:
+            wins_b += 1
+            outcome = "B wins"
+        print(f"  Game {i+1}/{args.games}: {outcome} ({ply} plies)")
+
+        # Swap colors for fairness (alternate who plays Red).
+        if (i + 1) % 2 == 0:
+            net_a, net_b = net_b, net_a
+            mcts_a, mcts_b = mcts_b, mcts_a
+
+    print("-" * 50)
+    print(f"Result: A={wins_a} wins, B={wins_b} wins, Draw={draws}")
+    rate_a = (wins_a + 0.5 * draws) / args.games
+    print(f"A score rate: {rate_a:.1%}")
+    return 0
+
+
 def cmd_test(_args) -> int:
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir="tests", pattern="test_*.py")
@@ -234,6 +303,15 @@ def main() -> int:
     p_viz.add_argument("--out", default="board.png", help="output PNG path")
     p_viz.add_argument("--title", default=None)
 
+    # --- compare ---
+    p_cmp = sub.add_parser("compare", help="compare two checkpoints head-to-head")
+    p_cmp.add_argument("model_a", help="path to first checkpoint (.pt)")
+    p_cmp.add_argument("model_b", help="path to second checkpoint (.pt)")
+    p_cmp.add_argument("--games", type=int, default=10,
+                       help="number of games to play (default: 10)")
+    p_cmp.add_argument("--simulations", type=int, default=100,
+                       help="MCTS simulations per move (default: 100)")
+
     # --- test ---
     sub.add_parser("test", help="run the unittest suite")
 
@@ -246,6 +324,7 @@ def main() -> int:
         "train": cmd_train,
         "api": cmd_api,
         "viz": cmd_viz,
+        "compare": cmd_compare,
         "test": cmd_test,
     }
     return handlers[args.cmd](args)

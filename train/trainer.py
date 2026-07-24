@@ -25,6 +25,7 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -85,6 +86,45 @@ def _print_training_progress(
         f"| {_format_time(elapsed)}<{_format_time(eta)}",
         end="", flush=True,
     )
+
+
+def _save_loss_history(history: List[Dict], path: str) -> None:
+    """Save training loss history to a JSON file."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"Loss history saved -> {path}")
+
+
+def _plot_loss_curve(history: List[Dict], path: str) -> None:
+    """Plot policy_loss and value_loss curves and save as PNG."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.info("matplotlib not installed; skipping loss curve plot. "
+                    "Install with: pip install matplotlib")
+        return
+
+    iters = [h["iteration"] for h in history]
+    policy = [h["policy_loss"] for h in history]
+    value = [h["value_loss"] for h in history]
+    total = [h["total_loss"] for h in history]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(iters, total, label="Total Loss", linewidth=1.5)
+    ax.plot(iters, policy, label="Policy Loss", linewidth=1, alpha=0.7)
+    ax.plot(iters, value, label="Value Loss", linewidth=1, alpha=0.7)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Loss Curve (Mini Xiangqi AlphaZero)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+    logger.info(f"Loss curve saved -> {path}")
 
 
 class _GameCollectingDataset:
@@ -298,6 +338,7 @@ class Trainer:
                     + (f" ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else ""))
 
         train_start_time = time.time()
+        loss_history: List[Dict] = []
 
         for it in range(start_iter, start_iter + iterations):
             iter_seed = None if seed is None else seed + it
@@ -363,6 +404,16 @@ class Trainer:
                 elapsed=elapsed, buffer_size=len(self.buffer),
             )
 
+            # Record loss history.
+            loss_history.append({
+                "iteration": it,
+                "total_loss": avg["total_loss"],
+                "policy_loss": avg["policy_loss"],
+                "value_loss": avg["value_loss"],
+                "sims": cur_sims,
+                "buffer_size": len(self.buffer),
+            })
+
             # 3. Checkpoint the iteration.
             metadata = {
                 "iteration": it,
@@ -377,6 +428,14 @@ class Trainer:
             self._maybe_promote_best(it, evaluate_games, evaluate_simulations, iter_seed)
 
         print()  # newline after progress bar
+
+        # Save loss history and plot curve.
+        if loss_history:
+            history_path = os.path.join(self.config.checkpoint_dir, "loss_history.json")
+            _save_loss_history(loss_history, history_path)
+            curve_path = os.path.join(self.config.checkpoint_dir, "loss_curve.png")
+            _plot_loss_curve(loss_history, curve_path)
+
         logger.info(f"Training complete. Total time: {_format_time(time.time() - train_start_time)}")
         return self.net
 
