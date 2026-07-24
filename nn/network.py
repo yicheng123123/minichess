@@ -200,7 +200,8 @@ if _HAS_TORCH:
             from engine.move_generator import legal_moves
 
             self.eval()
-            planes = torch.from_numpy(board.to_planes()).float().unsqueeze(0)
+            device = next(self.parameters()).device
+            planes = torch.from_numpy(board.to_planes()).float().unsqueeze(0).to(device)
             with torch.no_grad():
                 logits, value = self.forward(planes)
             logits = logits.squeeze(0)

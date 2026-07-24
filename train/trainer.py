@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from nn.dataset import SelfPlayDataset, SelfPlaySample
 from search.mcts import MCTS
-from selfplay.player import generate_games
+from selfplay.player import generate_games, generate_games_parallel
 from selfplay.arena import evaluate_match
 from utils.config import Config, get_config
 from utils.logger import logger
@@ -55,6 +56,35 @@ def _require_torch() -> None:
             "PyTorch is required for train.trainer; install torch to run the "
             "AlphaZero training loop."
         )
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds into a human-readable string like '1h 23m' or '4m 12s'."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+    else:
+        return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60):02d}m"
+
+
+def _print_training_progress(
+    current: int, total: int, loss: float, sims: int,
+    elapsed: float, buffer_size: int,
+) -> None:
+    """Print a single-line progress bar for the training loop."""
+    pct = (current + 1) / total
+    bar_len = 25
+    filled = int(bar_len * pct)
+    bar = "#" * filled + "-" * (bar_len - filled)
+
+    eta = elapsed / (current + 1) * (total - current - 1) if current > 0 else 0
+    print(
+        f"\r  [{bar}] {current+1}/{total} "
+        f"| loss={loss:.4f} sims={sims} buf={buffer_size} "
+        f"| {_format_time(elapsed)}<{_format_time(eta)}",
+        end="", flush=True,
+    )
 
 
 class _GameCollectingDataset:
@@ -119,13 +149,16 @@ class Trainer:
         self.config = config or get_config()
         cfg = self.config
 
+        # Device: use GPU if available.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         # Network: residual policy-value net sized from the config.
         if net is None:
             net = create_network(
                 hidden=cfg.hidden_channels,
                 num_res_blocks=cfg.num_res_blocks,
             )
-        self.net = net
+        self.net = net.to(self.device)
 
         # MCTS used for self-play (exploration noise on by default).
         self.mcts = MCTS(num_simulations=cfg.num_simulations, c_puct=cfg.c_puct)
@@ -175,13 +208,13 @@ class Trainer:
 
         planes = torch.stack(
             [torch.from_numpy(_as_numpy(s.planes)).float() for s in samples]
-        )
+        ).to(self.device)
         policy_target = torch.stack(
             [torch.from_numpy(_as_numpy(s.policy)).float() for s in samples]
-        )
+        ).to(self.device)
         value_target = torch.tensor(
             [s.value for s in samples], dtype=torch.float32
-        )
+        ).to(self.device)
 
         optimizer.zero_grad()
         logits, value = self.net(planes)
@@ -218,6 +251,8 @@ class Trainer:
         evaluate_simulations: Optional[int] = None,
         seed: Optional[int] = None,
         resume: bool = True,
+        num_workers: Optional[int] = None,
+        curriculum: bool = True,
     ) -> Any:
         """Run the AlphaZero self-play training loop.
 
@@ -259,18 +294,35 @@ class Trainer:
             f"games/iter={games_per_iter} epochs/iter={epochs_per_iter} "
             f"batch_size={batch_size} lr={lr}"
         )
+        logger.info(f"Device: {self.device}"
+                    + (f" ({torch.cuda.get_device_name(0)})" if self.device.type == "cuda" else ""))
+
+        train_start_time = time.time()
 
         for it in range(start_iter, start_iter + iterations):
             iter_seed = None if seed is None else seed + it
 
-            # 1. Self-play: generate games, push into buffer + dataset.
+            # Curriculum learning: ramp up simulations over the first half.
+            if curriculum and iterations > 1:
+                progress = min(1.0, (it - start_iter) / max(1, iterations // 2))
+                cur_sims = max(25, int(self.config.num_simulations * (0.25 + 0.75 * progress)))
+            else:
+                cur_sims = self.config.num_simulations
+            self.mcts.num_simulations = cur_sims
+
+            # 1. Self-play: generate games in parallel, push into buffer + dataset.
             adapter = _GameCollectingDataset(self.dataset)
-            outcomes = generate_games(
+            outcomes = generate_games_parallel(
                 adapter,
                 games_per_iter,
                 net=self.net,
                 mcts=self.mcts,
                 seed=iter_seed,
+                num_workers=num_workers,
+                net_kwargs={
+                    "hidden": self.config.hidden_channels,
+                    "num_res_blocks": self.config.num_res_blocks,
+                },
             )
             for game in adapter.games:
                 self.buffer.add_game(game)
@@ -280,8 +332,8 @@ class Trainer:
             draws = outcomes.count(0)
             logger.info(
                 f"[iter {it}] self-play: {len(outcomes)} games "
-                f"(red={red} black={black} draw={draws}); "
-                f"buffer={len(self.buffer)} samples"
+                f"(red={red} black={black} draw={draws}) "
+                f"sims={cur_sims}; buffer={len(self.buffer)} samples"
             )
 
             # 2. Train: run epochs_per_iter gradient steps on sampled batches.
@@ -303,6 +355,14 @@ class Trainer:
                 f"value_loss={avg['value_loss']:.4f}"
             )
 
+            # Visual progress bar.
+            elapsed = time.time() - train_start_time
+            _print_training_progress(
+                current=it - start_iter, total=iterations,
+                loss=avg["total_loss"], sims=cur_sims,
+                elapsed=elapsed, buffer_size=len(self.buffer),
+            )
+
             # 3. Checkpoint the iteration.
             metadata = {
                 "iteration": it,
@@ -316,7 +376,8 @@ class Trainer:
             # 4. Evaluate against the current best and maybe promote.
             self._maybe_promote_best(it, evaluate_games, evaluate_simulations, iter_seed)
 
-        logger.info("Training complete.")
+        print()  # newline after progress bar
+        logger.info(f"Training complete. Total time: {_format_time(time.time() - train_start_time)}")
         return self.net
 
     # ------------------------------------------------------------------ #

@@ -50,6 +50,7 @@ class GameOutcome(Enum):
     DRAW = "draw"
 
 
+
 class GameResult:
     """Terminal-state descriptor.
 

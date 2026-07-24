@@ -41,7 +41,7 @@ def _play_one_game(
         random.seed(seed)
 
     board = Board()
-    mcts = MCTS(simulations=mcts_simulations)
+    mcts = MCTS(num_simulations=mcts_simulations)
 
     ply = 0
     while ply < max_plies:

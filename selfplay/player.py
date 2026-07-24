@@ -343,6 +343,7 @@ def generate_games(
 
     for i in range(n_games):
         game_seed = (seed + i) if seed is not None else None
+        logger.info(f"  self-play game {i+1}/{n_games} ...")
 
         result = play_game(net=net, mcts=mcts, seed=game_seed, **kwargs)
         samples = result["samples"]
@@ -356,6 +357,9 @@ def generate_games(
             dataset.add(sample)
 
         outcomes.append(outcome)
+        outcome_str = {1: "Red wins", -1: "Black wins", 0: "Draw"}[outcome]
+        logger.info(f"  game {i+1}/{n_games} done: {outcome_str} "
+                    f"({len(samples)} samples)")
 
         if (i + 1) % 10 == 0 or (i + 1) == n_games:
             logger.info(
@@ -371,6 +375,151 @@ def generate_games(
     draws = outcomes.count(0)
     logger.info(
         f"Generated {n_games} games: "
+        f"Red={red_wins}, Black={black_wins}, Draw={draws}"
+    )
+
+    return outcomes
+
+
+# --------------------------------------------------------------------------- #
+# Parallel self-play (multi-process)
+# --------------------------------------------------------------------------- #
+def _play_one_game_worker(args: dict) -> dict:
+    """Worker function for parallel self-play. Runs in a separate process.
+
+    Receives a dict with all info needed to play one game, returns a dict
+    with samples, outcome, and plies. All data is serializable (numpy arrays,
+    plain dicts, ints, floats).
+    """
+    state_dict = args["state_dict"]
+    net_kwargs = args["net_kwargs"]
+    mcts_kwargs = args["mcts_kwargs"]
+    game_seed = args["game_seed"]
+    play_kwargs = args["play_kwargs"]
+
+    # Recreate network and MCTS in this process.
+    from nn.network import create_network
+    net = create_network(**net_kwargs)
+    net.load_state_dict(state_dict)
+    net.eval()
+
+    mcts = None
+    if mcts_kwargs is not None:
+        mcts = MCTS(**mcts_kwargs)
+
+    result = play_game(net=net, mcts=mcts, seed=game_seed, **play_kwargs)
+    return {
+        "samples": result["samples"],
+        "outcome": result["outcome"],
+        "plies": result["plies"],
+    }
+
+
+def generate_games_parallel(
+    dataset: SelfPlayDataset,
+    n_games: int,
+    net: "PolicyValueNet",
+    mcts: Optional[MCTS] = None,
+    seed: Optional[int] = None,
+    augment: bool = True,
+    num_workers: Optional[int] = None,
+    net_kwargs: Optional[dict] = None,
+    **kwargs,
+) -> List[int]:
+    """Play self-play games in parallel across multiple CPU cores.
+
+    This is the recommended way to generate training data. Each worker process
+    gets its own copy of the network and MCTS, plays one game independently,
+    and returns the results.
+
+    Args:
+        dataset: SelfPlayDataset instance for persisting samples.
+        n_games: Number of games to play.
+        net: Neural network (its state_dict is shared with workers).
+        mcts: Optional MCTS instance (config is shared with workers).
+        seed: Base random seed.
+        augment: If True, apply horizontal-flip augmentation.
+        num_workers: Number of parallel processes. Defaults to CPU count.
+        net_kwargs: Dict of kwargs for create_network (hidden, num_res_blocks).
+        **kwargs: Passed to play_game (max_plies, temperature, etc.).
+
+    Returns:
+        List of game outcomes (+1 Red wins, -1 Black wins, 0 draw).
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 4, n_games)
+
+    # Prepare serializable args for workers.
+    try:
+        state_dict = net.state_dict()
+    except AttributeError:
+        # RandomPolicyValueNet has no state_dict; fall back to serial.
+        logger.info("Network has no state_dict; falling back to serial play.")
+        return generate_games(dataset, n_games, net, mcts, seed, augment, **kwargs)
+
+    if net_kwargs is None:
+        net_kwargs = {
+            "hidden": getattr(net, "hidden", 128),
+            "num_res_blocks": getattr(net, "num_res_blocks", 4),
+        }
+
+    mcts_kwargs = None
+    if mcts is not None:
+        mcts_kwargs = {
+            "num_simulations": mcts.num_simulations,
+            "c_puct": mcts.c_puct,
+            "dirichlet_alpha": mcts.dirichlet_alpha,
+            "dirichlet_epsilon": mcts.dirichlet_epsilon,
+            "add_noise": mcts.add_noise,
+        }
+
+    # Build task list.
+    tasks = []
+    for i in range(n_games):
+        tasks.append({
+            "state_dict": state_dict,
+            "net_kwargs": net_kwargs,
+            "mcts_kwargs": mcts_kwargs,
+            "game_seed": (seed + i) if seed is not None else None,
+            "play_kwargs": kwargs,
+        })
+
+    logger.info(f"  self-play: {n_games} games on {num_workers} workers ...")
+
+    outcomes: List[int] = []
+    all_samples: List = []
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_play_one_game_worker, t): i
+                   for i, t in enumerate(tasks)}
+
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            result = future.result()
+            samples = result["samples"]
+            outcome = result["outcome"]
+
+            if augment:
+                samples = _augment_samples(samples)
+
+            for sample in samples:
+                dataset.add(sample)
+
+            outcomes.append(outcome)
+            if done_count % max(1, n_games // 5) == 0 or done_count == n_games:
+                logger.info(f"  self-play progress: {done_count}/{n_games} games done")
+
+    dataset.save()
+
+    red_wins = outcomes.count(1)
+    black_wins = outcomes.count(-1)
+    draws = outcomes.count(0)
+    logger.info(
+        f"Generated {n_games} games (parallel): "
         f"Red={red_wins}, Black={black_wins}, Draw={draws}"
     )
 

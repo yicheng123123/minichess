@@ -109,6 +109,12 @@ def cmd_selfplay(args) -> int:
 
 def cmd_train(args) -> int:
     from train.trainer import Trainer
+    from utils.config import get_config
+
+    # Allow overriding MCTS simulations for faster CPU training.
+    if args.simulations is not None:
+        cfg = get_config()
+        cfg.num_simulations = args.simulations
 
     trainer = Trainer()
     trainer.train(
@@ -117,6 +123,8 @@ def cmd_train(args) -> int:
         epochs_per_iter=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        num_workers=args.workers,
+        evaluate_games=args.eval_games,
     )
     return 0
 
@@ -206,6 +214,12 @@ def main() -> int:
                          help="training epochs per iteration")
     p_train.add_argument("--batch-size", type=int, default=64)
     p_train.add_argument("--lr", type=float, default=1e-3)
+    p_train.add_argument("--simulations", type=int, default=None,
+                         help="MCTS simulations per move (default: 400; use 50-100 for quick tests)")
+    p_train.add_argument("--workers", type=int, default=None,
+                         help="parallel self-play workers (default: CPU count)")
+    p_train.add_argument("--eval-games", type=int, default=10,
+                         help="arena evaluation games per iteration (default: 10)")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")
