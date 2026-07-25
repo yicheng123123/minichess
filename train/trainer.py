@@ -88,23 +88,33 @@ def _print_training_progress(
     )
 
 
-def _save_loss_history(history: List[Dict], path: str) -> None:
-    """Save training loss history to a JSON file."""
+def _save_loss_history(history: List[Dict], path: str, quiet: bool = False) -> None:
+    """Save training loss history to a JSON file.
+
+    When ``quiet`` is True the confirmation log line is suppressed, which is
+    useful when saving incrementally once per iteration.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
-    logger.info(f"Loss history saved -> {path}")
+    if not quiet:
+        logger.info(f"Loss history saved -> {path}")
 
 
-def _plot_loss_curve(history: List[Dict], path: str) -> None:
-    """Plot policy_loss and value_loss curves and save as PNG."""
+def _plot_loss_curve(history: List[Dict], path: str, quiet: bool = False) -> None:
+    """Plot policy_loss and value_loss curves and save as PNG.
+
+    When ``quiet`` is True log messages are suppressed, which is useful when
+    re-plotting incrementally once per iteration.
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")  # non-interactive backend
         import matplotlib.pyplot as plt
     except ImportError:
-        logger.info("matplotlib not installed; skipping loss curve plot. "
-                    "Install with: pip install matplotlib")
+        if not quiet:
+            logger.info("matplotlib not installed; skipping loss curve plot. "
+                        "Install with: pip install matplotlib")
         return
 
     iters = [h["iteration"] for h in history]
@@ -124,7 +134,8 @@ def _plot_loss_curve(history: List[Dict], path: str) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=100)
     plt.close(fig)
-    logger.info(f"Loss curve saved -> {path}")
+    if not quiet:
+        logger.info(f"Loss curve saved -> {path}")
 
 
 class _GameCollectingDataset:
@@ -428,6 +439,14 @@ class Trainer:
             }
             ckpt_path = self.checkpoints.save(self.net, it, metadata=metadata)
             logger.info(f"[iter {it}] saved checkpoint -> {ckpt_path}")
+
+            # Incrementally persist the loss record + curve so an interrupted
+            # run still keeps its progress. Negligible cost (a few KB JSON and
+            # a small PNG) next to the minutes spent on self-play/evaluation.
+            history_path = os.path.join(self.config.checkpoint_dir, "loss_history.json")
+            _save_loss_history(loss_history, history_path, quiet=True)
+            curve_path = os.path.join(self.config.checkpoint_dir, "loss_curve.png")
+            _plot_loss_curve(loss_history, curve_path, quiet=True)
 
             # 4. Evaluate against the current best and maybe promote.
             #    Honour eval_every: skip the (slow) arena match on most
