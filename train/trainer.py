@@ -289,6 +289,7 @@ class Trainer:
         lr: float = 1e-3,
         evaluate_games: int = 20,
         evaluate_simulations: Optional[int] = None,
+        eval_every: int = 1,
         seed: Optional[int] = None,
         resume: bool = True,
         num_workers: Optional[int] = None,
@@ -305,6 +306,10 @@ class Trainer:
             evaluate_games: Games per arena match against the current best.
             evaluate_simulations: MCTS simulations for arena play (defaults to
                 the configured self-play simulation count).
+            eval_every: Run the arena evaluation once every this many iterations
+                (1 = every iteration, the original behaviour). The first
+                iteration (to establish a baseline best.pt) and the final
+                iteration are always evaluated regardless.
             seed: Optional base seed for reproducibility.
             resume: If True, resume from the latest checkpoint when present.
 
@@ -425,7 +430,18 @@ class Trainer:
             logger.info(f"[iter {it}] saved checkpoint -> {ckpt_path}")
 
             # 4. Evaluate against the current best and maybe promote.
-            self._maybe_promote_best(it, evaluate_games, evaluate_simulations, iter_seed)
+            #    Honour eval_every: skip the (slow) arena match on most
+            #    iterations, but always evaluate on the first iteration (to
+            #    establish a baseline best.pt), on schedule, and on the last one.
+            is_last = (it == start_iter + iterations - 1)
+            no_best_yet = not self.checkpoints.has_best()
+            on_schedule = (eval_every <= 1) or ((it - start_iter) % eval_every == 0)
+            if on_schedule or is_last or no_best_yet:
+                self._maybe_promote_best(it, evaluate_games, evaluate_simulations, iter_seed)
+            else:
+                remaining = eval_every - ((it - start_iter) % eval_every)
+                logger.info(f"[iter {it}] skipping arena eval "
+                            f"(next eval in {remaining} iter)")
 
         print()  # newline after progress bar
 
@@ -545,6 +561,9 @@ def main() -> None:
                         help="learning rate (default: config.learning_rate)")
     parser.add_argument("--evaluate-games", type=int, default=20,
                         help="games per arena match against the best model")
+    parser.add_argument("--eval-every", type=int, default=1,
+                        help="run the arena match once every N iterations "
+                             "(default: 1 = every iteration)")
     parser.add_argument("--buffer-size", type=int, default=100_000,
                         help="replay buffer capacity")
     parser.add_argument("--accept-threshold", type=float, default=0.55,
@@ -581,6 +600,7 @@ def main() -> None:
         batch_size=config.batch_size,
         lr=config.learning_rate,
         evaluate_games=args.evaluate_games,
+        eval_every=args.eval_every,
         seed=args.seed,
         resume=not args.no_resume,
     )

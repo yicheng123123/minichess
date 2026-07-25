@@ -125,6 +125,7 @@ def cmd_train(args) -> int:
         lr=args.lr,
         num_workers=args.workers,
         evaluate_games=args.eval_games,
+        eval_every=args.eval_every,
     )
     return 0
 
@@ -289,6 +290,9 @@ def main() -> int:
                          help="parallel self-play workers (default: CPU count)")
     p_train.add_argument("--eval-games", type=int, default=10,
                          help="arena evaluation games per iteration (default: 10)")
+    p_train.add_argument("--eval-every", type=int, default=1,
+                         help="run arena evaluation once every N iterations "
+                              "(default: 1 = every iteration; use 3-5 to speed up)")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")
