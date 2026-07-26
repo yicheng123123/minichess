@@ -34,6 +34,8 @@ class Config:
         board_size: Board dimension (7x7 for Mini Xiangqi).
         num_simulations: Number of MCTS simulations per move.
         c_puct: PUCT exploration constant for MCTS.
+        dirichlet_alpha: Concentration of the root Dirichlet exploration noise
+            (0.15 suits a chess-like game with ~20-40 legal moves).
         temperature: Move selection temperature (1.0 = proportional to visit count).
         max_plies: Maximum game length before declaring a draw.
         learning_rate: Initial learning rate for training.
@@ -48,6 +50,7 @@ class Config:
     board_size: int = 7
     num_simulations: int = 400
     c_puct: float = 1.5
+    dirichlet_alpha: float = 0.15
     temperature: float = 1.0
     max_plies: int = 200
     learning_rate: float = 1e-3

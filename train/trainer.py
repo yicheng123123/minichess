@@ -212,7 +212,11 @@ class Trainer:
         self.net = net.to(self.device)
 
         # MCTS used for self-play (exploration noise on by default).
-        self.mcts = MCTS(num_simulations=cfg.num_simulations, c_puct=cfg.c_puct)
+        self.mcts = MCTS(
+            num_simulations=cfg.num_simulations,
+            c_puct=cfg.c_puct,
+            dirichlet_alpha=cfg.dirichlet_alpha,
+        )
 
         # Experience replay buffer.
         self.buffer = ReplayBuffer(max_size=replay_buffer_size)
@@ -369,7 +373,7 @@ class Trainer:
 
             # 1. Self-play: generate games in parallel, push into buffer + dataset.
             adapter = _GameCollectingDataset(self.dataset)
-            outcomes = generate_games_parallel(
+            outcomes, plies = generate_games_parallel(
                 adapter,
                 games_per_iter,
                 net=self.net,
@@ -387,9 +391,15 @@ class Trainer:
             red = outcomes.count(1)
             black = outcomes.count(-1)
             draws = outcomes.count(0)
+            n_games_done = len(outcomes)
+            win_rate = (red + black) / n_games_done if n_games_done else 0.0
+            draw_rate = draws / n_games_done if n_games_done else 0.0
+            avg_plies = sum(plies) / len(plies) if plies else 0.0
             logger.info(
-                f"[iter {it}] self-play: {len(outcomes)} games "
+                f"[iter {it}] self-play: {n_games_done} games "
                 f"(red={red} black={black} draw={draws}) "
+                f"win_rate={win_rate:.2f} draw_rate={draw_rate:.2f} "
+                f"avg_plies={avg_plies:.0f} "
                 f"sims={cur_sims}; buffer={len(self.buffer)} samples"
             )
 
@@ -514,6 +524,7 @@ class Trainer:
             n_games=evaluate_games,
             mcts_simulations=evaluate_simulations,
             seed=seed,
+            c_puct=self.config.c_puct,
         )
         total = result["wins_a"] + result["wins_b"] + result["draws"]
         score_rate = (result["wins_a"] + 0.5 * result["draws"]) / total if total else 0.0

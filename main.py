@@ -111,12 +111,15 @@ def cmd_train(args) -> int:
     from train.trainer import Trainer
     from utils.config import get_config
 
+    cfg = get_config()
     # Allow overriding MCTS simulations for faster CPU training.
     if args.simulations is not None:
-        cfg = get_config()
         cfg.num_simulations = args.simulations
+    # Allow overriding the root Dirichlet noise concentration (A/B testing).
+    if args.dirichlet_alpha is not None:
+        cfg.dirichlet_alpha = args.dirichlet_alpha
 
-    trainer = Trainer()
+    trainer = Trainer(accept_threshold=args.accept_threshold)
     trainer.train(
         iterations=args.iterations,
         games_per_iter=args.games,
@@ -286,6 +289,10 @@ def main() -> int:
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--simulations", type=int, default=None,
                          help="MCTS simulations per move (default: 400; use 50-100 for quick tests)")
+    p_train.add_argument("--dirichlet-alpha", type=float, default=None,
+                         help="root Dirichlet noise concentration for exploration "
+                              "(default: config value 0.15; try 0.1-0.3 to break "
+                              "repetitive play)")
     p_train.add_argument("--workers", type=int, default=None,
                          help="parallel self-play workers (default: CPU count)")
     p_train.add_argument("--eval-games", type=int, default=10,
@@ -293,6 +300,10 @@ def main() -> int:
     p_train.add_argument("--eval-every", type=int, default=1,
                          help="run arena evaluation once every N iterations "
                               "(default: 1 = every iteration; use 3-5 to speed up)")
+    p_train.add_argument("--accept-threshold", type=float, default=0.55,
+                         help="arena score rate needed to promote a new best model "
+                              "(default: 0.55; lower to 0.5 to let drawn matches "
+                              "promote too)")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")

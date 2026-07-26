@@ -134,7 +134,8 @@ class MCTS:
         more exploration of less-visited moves. Default 2.5.
     dirichlet_alpha : float
         Concentration parameter for Dirichlet noise added at the root.
-        Default 0.03 (suitable for games with ~30-50 legal moves).
+        Default 0.15 (suits a chess-like game with ~20-40 legal moves; the
+        smaller 0.03 used for Go is too sparse here).
     dirichlet_epsilon : float
         Mixing weight for Dirichlet noise at the root:
         P_noisy = (1 - eps) * P + eps * Dir(alpha). Default 0.25.
@@ -148,7 +149,7 @@ class MCTS:
         self,
         num_simulations: int = 400,
         c_puct: float = 2.5,
-        dirichlet_alpha: float = 0.03,
+        dirichlet_alpha: float = 0.15,
         dirichlet_epsilon: float = 0.25,
         add_noise: bool = True,
     ) -> None:

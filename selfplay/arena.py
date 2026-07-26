@@ -24,6 +24,7 @@ def _play_one_game(
     mcts_simulations: int = 100,
     seed: Optional[int] = None,
     max_plies: int = 200,
+    c_puct: float = 1.5,
 ) -> int:
     """Play a single game between two networks.
 
@@ -33,6 +34,7 @@ def _play_one_game(
         mcts_simulations: Number of MCTS simulations per move.
         seed: Optional random seed.
         max_plies: Maximum half-moves before draw.
+        c_puct: PUCT exploration constant; should match training (default 1.5).
 
     Returns:
         +1 if Red wins, -1 if Black wins, 0 for draw.
@@ -41,7 +43,9 @@ def _play_one_game(
         random.seed(seed)
 
     board = Board()
-    mcts = MCTS(num_simulations=mcts_simulations)
+    # Evaluation must be deterministic and comparable across runs: no Dirichlet
+    # noise at the root, and the same c_puct used during training.
+    mcts = MCTS(num_simulations=mcts_simulations, c_puct=c_puct, add_noise=False)
 
     ply = 0
     while ply < max_plies:
@@ -80,6 +84,7 @@ def evaluate_match(
     mcts_simulations: int = 100,
     seed: Optional[int] = None,
     max_plies: int = 200,
+    c_puct: float = 1.5,
 ) -> dict:
     """Evaluate two networks by playing a match of n_games.
 
@@ -95,6 +100,7 @@ def evaluate_match(
         mcts_simulations: MCTS simulations per move for both players.
         seed: Base random seed for reproducibility.
         max_plies: Maximum half-moves per game before declaring draw.
+        c_puct: PUCT exploration constant; should match training (default 1.5).
 
     Returns:
         Dictionary with keys:
@@ -123,6 +129,7 @@ def evaluate_match(
             mcts_simulations=mcts_simulations,
             seed=game_seed,
             max_plies=max_plies,
+            c_puct=c_puct,
         )
 
         # Map outcome back to net_a / net_b perspective

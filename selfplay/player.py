@@ -444,7 +444,9 @@ def generate_games_parallel(
         **kwargs: Passed to play_game (max_plies, temperature, etc.).
 
     Returns:
-        List of game outcomes (+1 Red wins, -1 Black wins, 0 draw).
+        A tuple ``(outcomes, plies)`` where ``outcomes`` is a list of game
+        results (+1 Red wins, -1 Black wins, 0 draw) and ``plies`` is a list
+        of the number of half-moves each game lasted.
     """
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -458,7 +460,8 @@ def generate_games_parallel(
     except AttributeError:
         # RandomPolicyValueNet has no state_dict; fall back to serial.
         logger.info("Network has no state_dict; falling back to serial play.")
-        return generate_games(dataset, n_games, net, mcts, seed, augment, **kwargs)
+        serial_outcomes = generate_games(dataset, n_games, net, mcts, seed, augment, **kwargs)
+        return serial_outcomes, []
 
     if net_kwargs is None:
         net_kwargs = {
@@ -490,6 +493,7 @@ def generate_games_parallel(
     logger.info(f"  self-play: {n_games} games on {num_workers} workers ...")
 
     outcomes: List[int] = []
+    all_plies: List[int] = []
     all_samples: List = []
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -510,6 +514,7 @@ def generate_games_parallel(
                 dataset.add(sample)
 
             outcomes.append(outcome)
+            all_plies.append(result["plies"])
             if done_count % max(1, n_games // 5) == 0 or done_count == n_games:
                 logger.info(f"  self-play progress: {done_count}/{n_games} games done")
 
@@ -518,9 +523,11 @@ def generate_games_parallel(
     red_wins = outcomes.count(1)
     black_wins = outcomes.count(-1)
     draws = outcomes.count(0)
+    avg_plies = sum(all_plies) / len(all_plies) if all_plies else 0.0
     logger.info(
         f"Generated {n_games} games (parallel): "
-        f"Red={red_wins}, Black={black_wins}, Draw={draws}"
+        f"Red={red_wins}, Black={black_wins}, Draw={draws} "
+        f"avg_plies={avg_plies:.0f}"
     )
 
-    return outcomes
+    return outcomes, all_plies
