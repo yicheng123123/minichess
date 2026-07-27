@@ -156,6 +156,8 @@ def cmd_train(args) -> int:
         warm_start=args.warm_start,
         warm_start_epochs=args.warm_start_epochs,
         fresh_buffer=args.fresh_buffer,
+        expert_replay=args.expert_replay,
+        expert_ratio=args.expert_ratio,
         resume=not args.no_resume,
     )
     return 0
@@ -366,6 +368,13 @@ def main() -> int:
                          help="resume the network but start the replay buffer "
                               "empty (skip re-reading the on-disk dataset); ideal "
                               "for a warm-start run")
+    p_train.add_argument("--expert-replay", default=None,
+                         help="path to an expert JSONL forming a PERMANENT expert "
+                              "buffer; each batch mixes expert_ratio of its samples "
+                              "from it (dual replay, keeps the value head alive)")
+    p_train.add_argument("--expert-ratio", type=float, default=0.25,
+                         help="fraction of each training batch drawn from the "
+                              "expert buffer (default: 0.25)")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")

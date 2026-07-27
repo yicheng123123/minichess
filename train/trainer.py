@@ -221,6 +221,13 @@ class Trainer:
         # Experience replay buffer.
         self.buffer = ReplayBuffer(max_size=replay_buffer_size)
 
+        # Permanent expert replay buffer (populated only when an expert-replay
+        # source is given). Never evicted, so it can contribute a steady fraction
+        # of decisive win/loss samples to every batch, counteracting the
+        # draw-dominated self-play distribution that otherwise collapses the
+        # value head toward zero.
+        self.expert_buffer: Optional[ReplayBuffer] = None
+
         # Checkpoint manager + on-disk self-play dataset.
         self.checkpoints = CheckpointManager(checkpoint_dir=cfg.checkpoint_dir)
         data_path = os.path.join(cfg.data_dir, "games", "games.jsonl")
@@ -292,6 +299,25 @@ class Trainer:
             "batch_size": len(samples),
         }
 
+    def _sample_batch(self, batch_size: int, expert_ratio: float) -> List[SelfPlaySample]:
+        """Sample a mini-batch, optionally mixing in permanent expert data.
+
+        When an expert buffer is loaded and ``expert_ratio`` > 0, a fixed
+        fraction of the batch comes from the expert buffer (decisive win/loss
+        samples) and the rest from the self-play buffer. This keeps a steady
+        value signal in every batch so the value head does not collapse toward
+        zero under a draw-dominated self-play distribution.
+        """
+        if (self.expert_buffer is not None and len(self.expert_buffer) > 0
+                and expert_ratio > 0):
+            n_expert = max(1, int(batch_size * expert_ratio))
+            n_selfplay = batch_size - n_expert
+            batch = self.expert_buffer.sample(n_expert)
+            if n_selfplay > 0:
+                batch = batch + self.buffer.sample(n_selfplay)
+            return batch
+        return self.buffer.sample(batch_size)
+
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
@@ -312,6 +338,8 @@ class Trainer:
         warm_start: Optional[str] = None,
         warm_start_epochs: int = 2,
         fresh_buffer: bool = False,
+        expert_replay: Optional[str] = None,
+        expert_ratio: float = 0.25,
     ) -> Any:
         """Run the AlphaZero self-play training loop.
 
@@ -342,6 +370,13 @@ class Trainer:
                 on-disk dataset. Useful for a warm-start run that should begin
                 from a clean buffer (expert data + new self-play only) instead
                 of re-reading a large, draw-heavy dataset.
+            expert_replay: Optional path to an expert JSONL whose samples are
+                loaded into a permanent expert buffer. Each training batch then
+                mixes ``expert_ratio`` of its samples from this buffer (decisive
+                win/loss data) and the rest from the self-play buffer, keeping a
+                steady value signal so the value head does not collapse to zero.
+            expert_ratio: Fraction of each batch drawn from the expert buffer
+                (default 0.25). Only used when ``expert_replay`` is provided.
 
         Returns:
             The trained network.
@@ -383,6 +418,16 @@ class Trainer:
             self.buffer.add_game(expert_samples)
             logger.info(f"Seeded replay buffer with {len(expert_samples)} expert "
                         f"samples; buffer={len(self.buffer)} samples")
+
+        # Optional permanent expert replay buffer for dual-replay batching.
+        if expert_replay:
+            from train.warmstart import load_expert_samples, expert_to_selfplay_samples
+            exp_raw = load_expert_samples(expert_replay)
+            exp_samples = expert_to_selfplay_samples(exp_raw)
+            self.expert_buffer = ReplayBuffer(max_size=max(len(exp_samples), 1))
+            self.expert_buffer.add_game(exp_samples)
+            logger.info(f"Expert replay buffer loaded: {len(self.expert_buffer)} "
+                        f"samples from {expert_replay}; batch mix ratio={expert_ratio:.0%}")
 
         optimizer = self._create_optimizer(self.net, lr)
         logger.info(
@@ -457,7 +502,7 @@ class Trainer:
 
             epoch_stats: List[Dict[str, float]] = []
             for _ in range(epochs_per_iter):
-                batch = self.buffer.sample(batch_size)
+                batch = self._sample_batch(batch_size, expert_ratio)
                 stats = self.train_batch(batch, optimizer)
                 epoch_stats.append(stats)
 
