@@ -149,6 +149,13 @@ class Board:
             self._grid[1][col] = Piece(PieceType.SOLDIER, Color.RED)
             self._grid[BOARD_SIZE - 2][col] = Piece(PieceType.SOLDIER, Color.BLACK)
 
+        # Cache king positions for O(1) find_king. Kings start on file d (col 3):
+        # Red at row 0, Black at the last row.
+        self._king_pos = {
+            Color.RED: (0, 3),
+            Color.BLACK: (BOARD_SIZE - 1, 3),
+        }
+
         self._keys = [self.position_key()]
         self._pos_counts = Counter({self._keys[0]: 1})
 
@@ -184,13 +191,12 @@ class Board:
         return r0 <= row <= r1 and c0 <= col <= c1
 
     def find_king(self, color: Color) -> Optional[Square]:
-        """Location of ``color``'s King, or ``None`` if it has been captured."""
-        target = Piece(PieceType.KING, color)
-        for row in range(BOARD_SIZE):
-            for col in range(BOARD_SIZE):
-                if self._grid[row][col] == target:
-                    return (row, col)
-        return None
+        """Location of ``color``'s King, or ``None`` if it has been captured.
+
+        O(1) lookup into a cache maintained by make_move/undo_move (profiling
+        showed the old 49-square scan was called ~1.75M times per game).
+        """
+        return self._king_pos[color]
 
     def pieces(self, color: Optional[Color] = None) -> Iterator[Tuple[Square, Piece]]:
         """Iterate ``(square, piece)``; optionally filtered by color."""
@@ -244,6 +250,12 @@ class Board:
         self._grid[move.to_row][move.to_col] = mover
         self._grid[move.from_row][move.from_col] = None
 
+        # Keep the king-position cache in sync.
+        if mover.ptype is PieceType.KING:
+            self._king_pos[mover.color] = (move.to_row, move.to_col)
+        if captured is not None and captured.ptype is PieceType.KING:
+            self._king_pos[captured.color] = None
+
         # Halfmove clock resets on captures and soldier advances, else grows.
         if captured is not None or mover.ptype is PieceType.SOLDIER:
             self._halfmove = 0
@@ -279,6 +291,12 @@ class Board:
 
         self._grid[record.move.from_row][record.move.from_col] = record.mover
         self._grid[record.move.to_row][record.move.to_col] = record.captured
+
+        # Restore the king-position cache.
+        if record.mover.ptype is PieceType.KING:
+            self._king_pos[record.mover.color] = (record.move.from_row, record.move.from_col)
+        if record.captured is not None and record.captured.ptype is PieceType.KING:
+            self._king_pos[record.captured.color] = (record.move.to_row, record.move.to_col)
 
         return record
 
@@ -323,6 +341,7 @@ class Board:
         new._side = self._side
         new._fullmove = self._fullmove
         new._halfmove = self._halfmove
+        new._king_pos = dict(self._king_pos)
         new._keys = list(self._keys)
         new._pos_counts = Counter(self._pos_counts)
         new._history = list(self._history)
@@ -393,6 +412,14 @@ class Board:
             if col != BOARD_SIZE:
                 push_msg = f"rank too short in FEN: {rank!r}"
                 raise ValueError(push_msg)
+
+        # Populate the king-position cache from the parsed grid.
+        board._king_pos = {Color.RED: None, Color.BLACK: None}
+        for r in range(BOARD_SIZE):
+            for c in range(BOARD_SIZE):
+                pc = board._grid[r][c]
+                if pc is not None and pc.ptype is PieceType.KING:
+                    board._king_pos[pc.color] = (r, c)
 
         board._side = side
         board._halfmove = halfmove
