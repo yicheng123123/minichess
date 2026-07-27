@@ -199,19 +199,26 @@ if _HAS_TORCH:
             """Single-position inference, returning the same format as the fallback."""
             from engine.move_generator import legal_moves
 
-            self.eval()
+            # Only flip to eval mode when needed; calling eval() on every predict
+            # was a 400k-call hotspot.
+            if self.training:
+                self.eval()
             device = next(self.parameters()).device
             planes = torch.from_numpy(board.to_planes()).float().unsqueeze(0).to(device)
             with torch.no_grad():
                 logits, value = self.forward(planes)
-            logits = logits.squeeze(0)
-            value = float(value.item())
+            value_f = float(value.item())
+
+            # Transfer the logits to CPU ONCE and index into numpy. The previous
+            # version called logits[i].item() per legal move (~40 GPU->CPU syncs
+            # per predict); a single transfer avoids that sync storm.
+            logits_np = logits.squeeze(0).cpu().numpy()
 
             # Only return logits for legal moves (caller masks anyway, but
             # returning a compact dict keeps MCTS allocations small).
             legal_idx = [move_to_index(m) for m in legal_moves(board)]
-            out: Dict[int, float] = {i: float(logits[i].item()) for i in legal_idx}
-            return out, value
+            out: Dict[int, float] = {i: float(logits_np[i]) for i in legal_idx}
+            return out, value_f
 
         def save(self, path: str) -> None:
             torch.save(self.state_dict(), path)
