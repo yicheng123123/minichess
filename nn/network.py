@@ -54,11 +54,15 @@ class PolicyValueNet:
     for testing.
     """
 
-    def predict(self, board: Board) -> Tuple[Dict[int, float], float]:
+    def predict(self, board: Board, legal_moves=None) -> Tuple[Dict[int, float], float]:
         """Return ``(policy_logits_by_action_index, value)``.
 
         ``policy_logits_by_action_index`` only needs entries for legal moves;
         callers are responsible for masking. ``value`` is in [-1, 1].
+
+        ``legal_moves`` may be a precomputed list of legal ``Move`` objects;
+        when omitted the implementation generates them itself. Passing them in
+        avoids recomputing move generation (MCTS already has them).
         """
         raise NotImplementedError
 
@@ -72,13 +76,13 @@ class RandomPolicyValueNet(PolicyValueNet):
     def __init__(self, seed: int | None = None) -> None:
         self._rng = random.Random(seed)
 
-    def predict(self, board: Board) -> Tuple[Dict[int, float], float]:
-        from engine.move_generator import legal_moves
-
-        moves = legal_moves(board)
+    def predict(self, board: Board, legal_moves=None) -> Tuple[Dict[int, float], float]:
+        if legal_moves is None:
+            from engine.move_generator import legal_moves as _gen_legal
+            legal_moves = _gen_legal(board)
         # Uniform probability over legal moves, returned as "logits" that the
         # caller will softmax-mask. Equal logits -> uniform after softmax.
-        logits = {move_to_index(m): 0.0 for m in moves}
+        logits = {move_to_index(m): 0.0 for m in legal_moves}
         value = 0.0
         return logits, value
 
@@ -195,10 +199,8 @@ if _HAS_TORCH:
             value = self.value_fc(v).squeeze(-1)
             return policy_logits, value
 
-        def predict(self, board: Board) -> Tuple[Dict[int, float], float]:
+        def predict(self, board: Board, legal_moves=None) -> Tuple[Dict[int, float], float]:
             """Single-position inference, returning the same format as the fallback."""
-            from engine.move_generator import legal_moves
-
             # Only flip to eval mode when needed; calling eval() on every predict
             # was a 400k-call hotspot.
             if self.training:
@@ -215,8 +217,12 @@ if _HAS_TORCH:
             logits_np = logits.squeeze(0).cpu().numpy()
 
             # Only return logits for legal moves (caller masks anyway, but
-            # returning a compact dict keeps MCTS allocations small).
-            legal_idx = [move_to_index(m) for m in legal_moves(board)]
+            # returning a compact dict keeps MCTS allocations small). Callers
+            # such as MCTS pass the moves they already generated.
+            if legal_moves is None:
+                from engine.move_generator import legal_moves as _gen_legal
+                legal_moves = _gen_legal(board)
+            legal_idx = [move_to_index(m) for m in legal_moves]
             out: Dict[int, float] = {i: float(logits_np[i]) for i in legal_idx}
             return out, value_f
 

@@ -138,7 +138,7 @@ def _select_move_from_net(
     if not moves:
         raise RuntimeError("no legal moves available")
 
-    logits, _value = net.predict(board)
+    logits, _value = net.predict(board, moves)
     scores = [logits.get(move_to_index(m), 0.0) for m in moves]
 
     if temperature <= 1e-3:

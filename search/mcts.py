@@ -219,10 +219,11 @@ class MCTS:
                 value = self._terminal_value(result, board.side_to_move)
             else:
                 # --- EXPAND ---
-                if node.is_leaf:
-                    self._expand_node(node, board, net)
-                # Get the network value for this position.
-                _, value = net.predict(board)
+                # SELECT descended to a leaf, so it has legal moves here.
+                # Expand it and reuse the value from the SAME forward pass that
+                # produced the policy priors (the old code ran the network twice
+                # per leaf: once for priors, once for the value).
+                value = self._expand_node(node, board, net)
 
             # --- BACKPROPAGATE ---
             self._backpropagate(search_path, value)
@@ -340,11 +341,15 @@ class MCTS:
         node: MCTSNode,
         board: Board,
         net: PolicyValueNet,
-    ) -> None:
+    ) -> float:
         """Expand a leaf node by creating children for all legal moves.
 
         Uses the neural network policy to assign prior probabilities to each
         child. The policy logits are masked to legal moves and softmaxed.
+
+        Returns the network's value estimate for this position (from the same
+        forward pass that produced the priors), so the caller need not evaluate
+        the network again. Returns 0.0 when there are no legal moves.
 
         Parameters
         ----------
@@ -358,10 +363,11 @@ class MCTS:
         moves = legal_moves(board)
         if not moves:
             # No legal moves — this is a terminal node (loss for side to move).
-            return
+            return 0.0
 
-        # Get raw policy logits from the network.
-        policy_logits, _ = net.predict(board)
+        # Get raw policy logits AND the value in a single forward pass; pass the
+        # legal moves we already computed so predict doesn't regenerate them.
+        policy_logits, value = net.predict(board, moves)
 
         # Mask to legal moves and compute softmax probabilities.
         legal_indices = {move_to_index(m): m for m in moves}
@@ -379,6 +385,8 @@ class MCTS:
         for move, prior in zip(move_list, priors):
             child = MCTSNode(parent=node, move=move, prior=prior)
             node.children[move] = child
+
+        return value
 
     # ------------------------------------------------------------------ #
     # BACKPROPAGATE phase
