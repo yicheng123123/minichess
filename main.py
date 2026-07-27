@@ -120,6 +120,7 @@ def cmd_expert(args) -> int:
         max_plies=args.max_plies,
         seed=args.seed,
         augment=not args.no_augment,
+        random_opening_plies=args.opening_plies,
     )
     decisive = sum(1 for o in outcomes if o != 0)
     print(f"generated {len(outcomes)} expert games ({decisive} decisive) -> {args.out}")
@@ -319,6 +320,9 @@ def main() -> int:
     p_exp.add_argument("--seed", type=int, default=0)
     p_exp.add_argument("--no-augment", action="store_true",
                        help="disable horizontal-flip augmentation")
+    p_exp.add_argument("--opening-plies", type=int, default=8,
+                       help="random opening half-moves before alpha-beta plays, "
+                            "to make each game unique (default: 8)")
 
     # --- train ---
     p_train = sub.add_parser("train", help="run the AlphaZero training loop")

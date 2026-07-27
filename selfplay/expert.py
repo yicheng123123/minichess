@@ -44,6 +44,7 @@ from typing import List, Optional
 import numpy as np
 
 from engine.board import Board
+from engine.move_generator import legal_moves
 from engine.piece import Color
 from engine.rules import game_result, GameOutcome
 from search.alphabeta import alphabeta
@@ -68,6 +69,7 @@ def play_expert_game(
     high_plays_red: bool = True,
     max_plies: int = 200,
     seed: Optional[int] = None,
+    random_opening_plies: int = 8,
 ) -> dict:
     """Play one AB(depth_high) vs AB(depth_low) game and collect raw samples.
 
@@ -78,6 +80,12 @@ def play_expert_game(
             across games so the teacher covers both colors).
         max_plies: Cap on half-moves before the game is scored a draw.
         seed: Optional random seed (alpha-beta is otherwise deterministic).
+        random_opening_plies: Number of half-moves played with uniformly random
+            legal moves before alpha-beta takes over. Alpha-beta is fully
+            deterministic, so without this every game at the same depths is
+            identical; a randomized (but seeded) opening gives each game a
+            distinct trajectory. These opening plies are not recorded as
+            training data — recording starts once alpha-beta plays.
 
     Returns:
         ``{"samples": [...], "outcome": int, "plies": int}`` where each sample
@@ -89,8 +97,19 @@ def play_expert_game(
     board = Board()
     high_color = Color.RED if high_plays_red else Color.BLACK
 
+    # Randomized opening (not recorded) to diversify the games.
+    opening = 0
+    while opening < random_opening_plies:
+        if game_result(board) is not None:
+            break
+        moves = legal_moves(board)
+        if not moves:
+            break
+        board.make_move(random.choice(moves))
+        opening += 1
+
     history: List[tuple] = []  # (planes, move, mover)
-    ply = 0
+    ply = opening
     while ply < max_plies:
         if game_result(board) is not None:
             break
@@ -157,6 +176,7 @@ def generate_expert_games(
     max_plies: int = 200,
     seed: int = 0,
     augment: bool = True,
+    random_opening_plies: int = 8,
 ) -> List[int]:
     """Play ``n_games`` expert games and append them to ``out_path`` (JSONL).
 
@@ -182,6 +202,7 @@ def generate_expert_games(
                 high_plays_red=high_plays_red,
                 max_plies=max_plies,
                 seed=seed + i,
+                random_opening_plies=random_opening_plies,
             )
             samples = game["samples"]
             if augment:
