@@ -39,7 +39,7 @@ from utils.logger import logger
 from utils.seed import set_seed
 
 from train.checkpoint import CheckpointManager
-from train.replay_buffer import ReplayBuffer
+from train.replay_buffer import ReplayBuffer, DualReplayBuffer
 
 try:
     import torch
@@ -86,6 +86,26 @@ def _print_training_progress(
         f"| {_format_time(elapsed)}<{_format_time(eta)}",
         end="", flush=True,
     )
+
+
+def _save_metrics_csv(rows: List[Dict], path: str, quiet: bool = False) -> None:
+    """Write per-iteration experiment metrics to a CSV file.
+
+    Columns are taken from the first row's keys. Creates parent directories.
+    """
+    import csv
+
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    if not quiet:
+        logger.info(f"Metrics saved -> {path}")
 
 
 def _save_loss_history(history: List[Dict], path: str, quiet: bool = False) -> None:
@@ -218,15 +238,11 @@ class Trainer:
             dirichlet_alpha=cfg.dirichlet_alpha,
         )
 
-        # Experience replay buffer.
-        self.buffer = ReplayBuffer(max_size=replay_buffer_size)
-
-        # Permanent expert replay buffer (populated only when an expert-replay
-        # source is given). Never evicted, so it can contribute a steady fraction
-        # of decisive win/loss samples to every batch, counteracting the
-        # draw-dominated self-play distribution that otherwise collapses the
-        # value head toward zero.
-        self.expert_buffer: Optional[ReplayBuffer] = None
+        # Experience replay: a dual buffer holding a FIFO self-play pool and a
+        # permanent expert pool (the latter populated only when an expert-replay
+        # source is given). Sampling mixes the two so every batch can carry a
+        # steady fraction of decisive win/loss data.
+        self.buffer = DualReplayBuffer(selfplay_capacity=replay_buffer_size)
 
         # Checkpoint manager + on-disk self-play dataset.
         self.checkpoints = CheckpointManager(checkpoint_dir=cfg.checkpoint_dir)
@@ -249,6 +265,7 @@ class Trainer:
         optimizer: "torch.optim.Optimizer",
         value_weight: float = 1.0,
         l2_weight: float = 0.0,
+        sources: Optional[List[str]] = None,
     ) -> Dict[str, float]:
         """Run one gradient step on a mini-batch of samples.
 
@@ -257,14 +274,20 @@ class Trainer:
             optimizer: The optimizer to step.
             value_weight: Weight of the value loss in the combined loss.
             l2_weight: Optional L2 regularization weight (0 disables it).
+            sources: Optional list parallel to ``samples`` tagging each sample
+                as ``"expert"`` or ``"selfplay"``. When given, the value loss is
+                also reported per source (``expert_value_loss`` /
+                ``selfplay_value_loss``) to expose distribution problems.
 
         Returns:
             A dict of scalar metrics: ``total_loss``, ``policy_loss``,
-            ``value_loss`` and ``batch_size``.
+            ``value_loss``, ``expert_value_loss``, ``selfplay_value_loss``
+            and ``batch_size``.
         """
         if not samples:
             return {"total_loss": 0.0, "policy_loss": 0.0,
-                    "value_loss": 0.0, "batch_size": 0}
+                    "value_loss": 0.0, "expert_value_loss": 0.0,
+                    "selfplay_value_loss": 0.0, "batch_size": 0}
 
         self.net.train()
 
@@ -292,31 +315,49 @@ class Trainer:
         total.backward()
         optimizer.step()
 
+        # Per-source value loss (diagnostic): is the value head fitting the
+        # decisive expert data while the draw-heavy self-play data pulls it to 0?
+        expert_value_loss = 0.0
+        selfplay_value_loss = 0.0
+        if sources is not None:
+            expert_mask = torch.tensor(
+                [s == "expert" for s in sources], dtype=torch.bool, device=self.device
+            )
+            selfplay_mask = ~expert_mask
+            if expert_mask.any():
+                expert_value_loss = float(nn_loss.value_loss(
+                    value[expert_mask], value_target[expert_mask]).item())
+            if selfplay_mask.any():
+                selfplay_value_loss = float(nn_loss.value_loss(
+                    value[selfplay_mask], value_target[selfplay_mask]).item())
+
         return {
             "total_loss": float(total.item()),
             "policy_loss": float(policy_loss.item()),
             "value_loss": float(value_loss.item()),
+            "expert_value_loss": expert_value_loss,
+            "selfplay_value_loss": selfplay_value_loss,
             "batch_size": len(samples),
         }
 
-    def _sample_batch(self, batch_size: int, expert_ratio: float) -> List[SelfPlaySample]:
-        """Sample a mini-batch, optionally mixing in permanent expert data.
+    def _value_health(self, n: int = 100) -> tuple:
+        """Sample self-play states and report the network value mean/std.
 
-        When an expert buffer is loaded and ``expert_ratio`` > 0, a fixed
-        fraction of the batch comes from the expert buffer (decisive win/loss
-        samples) and the rest from the self-play buffer. This keeps a steady
-        value signal in every batch so the value head does not collapse toward
-        zero under a draw-dominated self-play distribution.
+        A healthy value head outputs a spread of values (std notably > 0); a
+        collapsed one hugs zero (mean~0, std~0). Useful per-iteration diagnostic.
         """
-        if (self.expert_buffer is not None and len(self.expert_buffer) > 0
-                and expert_ratio > 0):
-            n_expert = max(1, int(batch_size * expert_ratio))
-            n_selfplay = batch_size - n_expert
-            batch = self.expert_buffer.sample(n_expert)
-            if n_selfplay > 0:
-                batch = batch + self.buffer.sample(n_selfplay)
-            return batch
-        return self.buffer.sample(batch_size)
+        pool = self.buffer.selfplay
+        if len(pool) == 0:
+            return 0.0, 0.0
+        states = pool.sample(min(n, len(pool)))
+        self.net.eval()
+        planes = torch.stack(
+            [torch.from_numpy(_as_numpy(s.planes)).float() for s in states]
+        ).to(self.device)
+        with torch.no_grad():
+            _, value = self.net(planes)
+        v = value.detach().cpu()
+        return float(v.mean().item()), float(v.std().item())
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -398,7 +439,7 @@ class Trainer:
                                 "from the on-disk dataset")
                 else:
                     # Warm the buffer from persisted self-play data, if any.
-                    loaded = self.buffer.load_from_dataset(self.dataset)
+                    loaded = self.buffer.load_selfplay_from_dataset(self.dataset)
                     logger.info(f"Replay buffer warmed with {loaded} games "
                                 f"({len(self.buffer)} samples)")
 
@@ -419,15 +460,14 @@ class Trainer:
             logger.info(f"Seeded replay buffer with {len(expert_samples)} expert "
                         f"samples; buffer={len(self.buffer)} samples")
 
-        # Optional permanent expert replay buffer for dual-replay batching.
+        # Optional permanent expert pool for dual-replay batching.
         if expert_replay:
             from train.warmstart import load_expert_samples, expert_to_selfplay_samples
             exp_raw = load_expert_samples(expert_replay)
             exp_samples = expert_to_selfplay_samples(exp_raw)
-            self.expert_buffer = ReplayBuffer(max_size=max(len(exp_samples), 1))
-            self.expert_buffer.add_game(exp_samples)
-            logger.info(f"Expert replay buffer loaded: {len(self.expert_buffer)} "
-                        f"samples from {expert_replay}; batch mix ratio={expert_ratio:.0%}")
+            n_exp = self.buffer.load_expert(exp_samples)
+            logger.info(f"Expert replay pool loaded: {n_exp} samples from "
+                        f"{expert_replay}; batch mix ratio={expert_ratio:.0%}")
 
         optimizer = self._create_optimizer(self.net, lr)
         logger.info(
@@ -440,6 +480,7 @@ class Trainer:
 
         train_start_time = time.time()
         loss_history: List[Dict] = []
+        metrics_rows: List[Dict] = []
 
         for it in range(start_iter, start_iter + iterations):
             iter_seed = None if seed is None else seed + it
@@ -485,7 +526,7 @@ class Trainer:
             )
 
             # Replay buffer outcome composition (is decisive data accumulating?).
-            comp = self.buffer.value_composition()
+            comp = self.buffer.selfplay_composition()
             tot = comp["total"] or 1
             logger.info(
                 f"[iter {it}] buffer mix: "
@@ -502,8 +543,8 @@ class Trainer:
 
             epoch_stats: List[Dict[str, float]] = []
             for _ in range(epochs_per_iter):
-                batch = self._sample_batch(batch_size, expert_ratio)
-                stats = self.train_batch(batch, optimizer)
+                batch, sources = self.buffer.sample(batch_size, expert_ratio)
+                stats = self.train_batch(batch, optimizer, sources=sources)
                 epoch_stats.append(stats)
 
             avg = _average_stats(epoch_stats)
@@ -511,7 +552,42 @@ class Trainer:
                 f"[iter {it}] train: {epochs_per_iter} steps "
                 f"total_loss={avg['total_loss']:.4f} "
                 f"policy_loss={avg['policy_loss']:.4f} "
-                f"value_loss={avg['value_loss']:.4f}"
+                f"value_loss={avg['value_loss']:.4f} "
+                f"(expert_v={avg['expert_value_loss']:.4f} "
+                f"selfplay_v={avg['selfplay_value_loss']:.4f})"
+            )
+
+            # Value-head health: a collapsed head hugs zero (std~0).
+            value_mean, value_std = self._value_health()
+            logger.info(
+                f"[iter {it}] value health: mean={value_mean:+.3f} "
+                f"std={value_std:.3f}"
+            )
+
+            # Record a full metrics row for experiment analysis (CSV export).
+            metrics_rows.append({
+                "iteration": it,
+                "policy_loss": avg["policy_loss"],
+                "value_loss": avg["value_loss"],
+                "expert_value_loss": avg["expert_value_loss"],
+                "selfplay_value_loss": avg["selfplay_value_loss"],
+                "value_mean": value_mean,
+                "value_std": value_std,
+                "win_rate": win_rate,
+                "draw_rate": draw_rate,
+                "avg_plies": avg_plies,
+                "selfplay_win_pct": 100 * comp["win"] / tot,
+                "selfplay_draw_pct": 100 * comp["draw"] / tot,
+                "sims": cur_sims,
+                "selfplay_buffer": len(self.buffer),
+                "expert_buffer": len(self.buffer.expert) if self.buffer.expert else 0,
+            })
+
+            # Incrementally persist the experiment metrics CSV.
+            _save_metrics_csv(
+                metrics_rows,
+                os.path.join(self.config.checkpoint_dir, "metrics.csv"),
+                quiet=True,
             )
 
             # Visual progress bar.
@@ -572,6 +648,13 @@ class Trainer:
             _save_loss_history(loss_history, history_path)
             curve_path = os.path.join(self.config.checkpoint_dir, "loss_curve.png")
             _plot_loss_curve(loss_history, curve_path)
+
+        # Save the full experiment metrics CSV.
+        if metrics_rows:
+            _save_metrics_csv(
+                metrics_rows,
+                os.path.join(self.config.checkpoint_dir, "metrics.csv"),
+            )
 
         logger.info(f"Training complete. Total time: {_format_time(time.time() - train_start_time)}")
         return self.net

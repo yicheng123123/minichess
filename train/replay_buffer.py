@@ -187,3 +187,80 @@ class ReplayBuffer:
 
     def __repr__(self) -> str:
         return f"ReplayBuffer(size={len(self._buffer)}, max_size={self.max_size})"
+
+
+class DualReplayBuffer:
+    """Two-pool replay buffer: a permanent expert pool + a FIFO self-play pool.
+
+    Wrapping the two pools (instead of bolting an expert buffer onto the trainer)
+    keeps the sampling policy in one place. Changing the expert mix — e.g. the
+    Exp3 annealing schedule (40% -> 20% -> 5% -> 0%) — is then just a matter of
+    passing a different ``expert_ratio`` to :meth:`sample`; the data structures
+    stay untouched.
+
+    :meth:`sample` returns ``(batch, sources)`` where ``sources`` is a list
+    parallel to ``batch`` tagging each sample as ``"expert"`` or ``"selfplay"``,
+    so callers can compute per-source losses (e.g. expert_value_loss vs
+    selfplay_value_loss) to diagnose distribution problems.
+    """
+
+    def __init__(self, selfplay_capacity: int = 100_000) -> None:
+        self.selfplay = ReplayBuffer(max_size=selfplay_capacity)
+        self.expert: Optional[ReplayBuffer] = None
+
+    # ------------------------------------------------------------------ #
+    # Population
+    # ------------------------------------------------------------------ #
+    def load_expert(self, samples: List[SelfPlaySample]) -> int:
+        """Fill the permanent expert pool (sized to keep every sample)."""
+        self.expert = ReplayBuffer(max_size=max(len(samples), 1))
+        self.expert.add_game(samples)
+        return len(self.expert)
+
+    def add_game(self, samples: List[SelfPlaySample]) -> None:
+        """Add a finished self-play game to the FIFO self-play pool."""
+        self.selfplay.add_game(samples)
+
+    def load_selfplay_from_dataset(
+        self, dataset: SelfPlayDataset, max_games: Optional[int] = None
+    ) -> int:
+        """Warm the self-play pool from an on-disk dataset (delegated)."""
+        return self.selfplay.load_from_dataset(dataset, max_games)
+
+    # ------------------------------------------------------------------ #
+    # Sampling
+    # ------------------------------------------------------------------ #
+    def sample(self, batch_size: int, expert_ratio: float = 0.25):
+        """Return ``(batch, sources)`` mixing expert and self-play samples.
+
+        When an expert pool is loaded and ``expert_ratio`` > 0, a fixed fraction
+        of the batch comes from the (decisive) expert pool and the remainder
+        from the self-play pool. ``sources`` tags each sample's origin.
+        """
+        if self.expert is not None and len(self.expert) > 0 and expert_ratio > 0:
+            n_expert = max(1, int(batch_size * expert_ratio))
+            n_selfplay = batch_size - n_expert
+            expert_part = self.expert.sample(n_expert)
+            selfplay_part = self.selfplay.sample(n_selfplay) if n_selfplay > 0 else []
+            batch = expert_part + selfplay_part
+            sources = (["expert"] * len(expert_part)
+                       + ["selfplay"] * len(selfplay_part))
+            return batch, sources
+        batch = self.selfplay.sample(batch_size)
+        return batch, ["selfplay"] * len(batch)
+
+    # ------------------------------------------------------------------ #
+    # Diagnostics / passthroughs
+    # ------------------------------------------------------------------ #
+    def selfplay_composition(self) -> dict:
+        """Outcome composition of the self-play pool (win/loss/draw counts)."""
+        return self.selfplay.value_composition()
+
+    def __len__(self) -> int:
+        """Size of the self-play pool (expert pool is reported separately)."""
+        return len(self.selfplay)
+
+    def __repr__(self) -> str:
+        exp = len(self.expert) if self.expert is not None else 0
+        return (f"DualReplayBuffer(selfplay={len(self.selfplay)}, "
+                f"expert={exp})")
