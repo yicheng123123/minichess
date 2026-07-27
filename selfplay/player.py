@@ -384,6 +384,13 @@ def generate_games(
 # --------------------------------------------------------------------------- #
 # Parallel self-play (multi-process)
 # --------------------------------------------------------------------------- #
+# Persistent per-worker network. Each worker process builds its network once
+# (first game) and reuses it for every subsequent game/iteration, reloading
+# only the updated weights. Combined with the persistent pool below, this
+# eliminates the per-iteration process-spawn + torch-import + model-build cost.
+_WORKER_NET = None
+
+
 def _play_one_game_worker(args: dict) -> dict:
     """Worker function for parallel self-play. Runs in a separate process.
 
@@ -391,28 +398,61 @@ def _play_one_game_worker(args: dict) -> dict:
     with samples, outcome, and plies. All data is serializable (numpy arrays,
     plain dicts, ints, floats).
     """
+    global _WORKER_NET
     state_dict = args["state_dict"]
     net_kwargs = args["net_kwargs"]
     mcts_kwargs = args["mcts_kwargs"]
     game_seed = args["game_seed"]
     play_kwargs = args["play_kwargs"]
 
-    # Recreate network and MCTS in this process.
-    from nn.network import create_network
-    net = create_network(**net_kwargs)
-    net.load_state_dict(state_dict)
-    net.eval()
+    # Build the network once per worker process; afterwards just load the
+    # (iteration-updated) weights into the existing object.
+    if _WORKER_NET is None:
+        from nn.network import create_network
+        _WORKER_NET = create_network(**net_kwargs)
+    _WORKER_NET.load_state_dict(state_dict)
+    _WORKER_NET.eval()
 
     mcts = None
     if mcts_kwargs is not None:
         mcts = MCTS(**mcts_kwargs)
 
-    result = play_game(net=net, mcts=mcts, seed=game_seed, **play_kwargs)
+    result = play_game(net=_WORKER_NET, mcts=mcts, seed=game_seed, **play_kwargs)
     return {
         "samples": result["samples"],
         "outcome": result["outcome"],
         "plies": result["plies"],
     }
+
+
+# Persistent process pool, reused across generate_games_parallel calls so the
+# worker processes (and their imported modules / built networks) stay alive
+# between training iterations instead of being respawned every time.
+_POOL = None
+_POOL_WORKERS = None
+
+
+def _get_pool(num_workers: int):
+    """Return a persistent ProcessPoolExecutor, creating it on first use."""
+    global _POOL, _POOL_WORKERS
+    import atexit
+    from concurrent.futures import ProcessPoolExecutor
+    if _POOL is None or _POOL_WORKERS != num_workers:
+        if _POOL is not None:
+            _POOL.shutdown(wait=True)
+        _POOL = ProcessPoolExecutor(max_workers=num_workers)
+        _POOL_WORKERS = num_workers
+        atexit.register(shutdown_worker_pool)
+    return _POOL
+
+
+def shutdown_worker_pool() -> None:
+    """Shut down the persistent worker pool (registered for clean exit)."""
+    global _POOL, _POOL_WORKERS
+    if _POOL is not None:
+        _POOL.shutdown(wait=True)
+        _POOL = None
+        _POOL_WORKERS = None
 
 
 def generate_games_parallel(
@@ -449,7 +489,7 @@ def generate_games_parallel(
         of the number of half-moves each game lasted.
     """
     import os
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import as_completed
 
     if num_workers is None:
         num_workers = min(os.cpu_count() or 4, n_games)
@@ -496,27 +536,27 @@ def generate_games_parallel(
     all_plies: List[int] = []
     all_samples: List = []
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(_play_one_game_worker, t): i
-                   for i, t in enumerate(tasks)}
+    executor = _get_pool(num_workers)
+    futures = {executor.submit(_play_one_game_worker, t): i
+               for i, t in enumerate(tasks)}
 
-        done_count = 0
-        for future in as_completed(futures):
-            done_count += 1
-            result = future.result()
-            samples = result["samples"]
-            outcome = result["outcome"]
+    done_count = 0
+    for future in as_completed(futures):
+        done_count += 1
+        result = future.result()
+        samples = result["samples"]
+        outcome = result["outcome"]
 
-            if augment:
-                samples = _augment_samples(samples)
+        if augment:
+            samples = _augment_samples(samples)
 
-            for sample in samples:
-                dataset.add(sample)
+        for sample in samples:
+            dataset.add(sample)
 
-            outcomes.append(outcome)
-            all_plies.append(result["plies"])
-            if done_count % max(1, n_games // 5) == 0 or done_count == n_games:
-                logger.info(f"  self-play progress: {done_count}/{n_games} games done")
+        outcomes.append(outcome)
+        all_plies.append(result["plies"])
+        if done_count % max(1, n_games // 5) == 0 or done_count == n_games:
+            logger.info(f"  self-play progress: {done_count}/{n_games} games done")
 
     dataset.save()
 
