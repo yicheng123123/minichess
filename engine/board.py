@@ -49,6 +49,7 @@ Algebraic notation uses files ``a..g`` (col 0..6) and ranks ``1..7``
 from __future__ import annotations
 
 from collections import Counter
+import random
 from typing import Iterator, List, Optional, Tuple
 
 from .piece import Color, Piece, PieceType
@@ -80,6 +81,38 @@ _SOLDIER_COLS: Tuple[int, ...] = (0, 2, 3, 4, 6)
 
 # Back-rank layout, col 0..6 (symmetric around the king on col 3).
 _BACK_RANK: Tuple[str, ...] = ("R", "C", "N", "K", "N", "C", "R")
+
+# --------------------------------------------------------------------------- #
+# Zobrist hashing (incremental position hashing for fast repetition detection)
+# --------------------------------------------------------------------------- #
+# A position's hash is the XOR of a random bitstring per (square, piece-kind)
+# present, plus a side-to-move key. make_move/undo_move update it in O(1)
+# instead of rebuilding a board string, which profiling showed cost ~16s/game.
+
+# Piece-kind index: color (0=Red, 1=Black) * 5 + piece-type index.
+_PIECE_TYPE_INDEX = {
+    PieceType.KING: 0, PieceType.ROOK: 1, PieceType.HORSE: 2,
+    PieceType.CANNON: 3, PieceType.SOLDIER: 4,
+}
+_NUM_PIECE_KINDS = 10
+
+
+def _piece_kind(piece: Piece) -> int:
+    color_idx = 0 if piece.color is Color.RED else 1
+    return color_idx * 5 + _PIECE_TYPE_INDEX[piece.ptype]
+
+
+def _sq_index(row: int, col: int) -> int:
+    return row * BOARD_SIZE + col
+
+
+# Random bitstrings, generated once with a fixed seed for determinism.
+_zrng = random.Random(0xC0FFEE)
+ZOBRIST_PIECE = [
+    [_zrng.getrandbits(64) for _ in range(_NUM_PIECE_KINDS)]
+    for _ in range(NUM_SQUARES)
+]
+ZOBRIST_SIDE = _zrng.getrandbits(64)  # XORed in when Black is to move
 
 
 # --------------------------------------------------------------------------- #
@@ -120,10 +153,10 @@ class Board:
         self._side: Color = Color.RED
         self._fullmove: int = 1          # increments after Black moves
         self._halfmove: int = 0          # plies since last capture or soldier advance
-        # Position-key history, one entry per position reached (incl. start).
-        # `_pos_counts` mirrors it for O(1) repetition queries.
-        self._keys: List[str] = []
-        self._pos_counts: Counter = Counter()
+        # Zobrist-hash history, one entry per position reached (incl. start).
+        # `_zcounts` mirrors it for O(1) repetition queries.
+        self._zstack: List[int] = []
+        self._zcounts: Counter = Counter()
         self._history: List[_UndoRecord] = []
         self.reset()
 
@@ -136,8 +169,8 @@ class Board:
         self._side = Color.RED
         self._fullmove = 1
         self._halfmove = 0
-        self._keys = []
-        self._pos_counts = Counter()
+        self._zstack = []
+        self._zcounts = Counter()
         self._history = []
 
         # Red back rank (row 0) and Black back rank (row 6).
@@ -156,8 +189,9 @@ class Board:
             Color.BLACK: (BOARD_SIZE - 1, 3),
         }
 
-        self._keys = [self.position_key()]
-        self._pos_counts = Counter({self._keys[0]: 1})
+        z = self._compute_zhash()
+        self._zstack = [z]
+        self._zcounts = Counter({z: 1})
 
     # ------------------------------------------------------------------ #
     # Basic queries
@@ -266,10 +300,18 @@ class Board:
 
         self._side = self._side.opponent
 
-        # Record the new position for repetition tracking.
-        key = self.position_key()
-        self._keys.append(key)
-        self._pos_counts[key] += 1
+        # Update the Zobrist hash incrementally for repetition tracking (O(1);
+        # XOR is its own inverse, so removing/adding a piece is just an XOR).
+        z = self._zstack[-1]
+        from_idx = _sq_index(move.from_row, move.from_col)
+        to_idx = _sq_index(move.to_row, move.to_col)
+        z ^= ZOBRIST_PIECE[from_idx][_piece_kind(mover)]
+        z ^= ZOBRIST_PIECE[to_idx][_piece_kind(mover)]
+        if captured is not None:
+            z ^= ZOBRIST_PIECE[to_idx][_piece_kind(captured)]
+        z ^= ZOBRIST_SIDE  # side to move flipped
+        self._zstack.append(z)
+        self._zcounts[z] += 1
 
         return captured
 
@@ -279,7 +321,7 @@ class Board:
             return None
 
         # Drop the position reached by the move being undone.
-        self._pos_counts[self._keys.pop()] -= 1
+        self._zcounts[self._zstack.pop()] -= 1
         # (Counter entries are left at 0; harmless and avoids key churn.)
 
         record = self._history.pop()
@@ -303,6 +345,22 @@ class Board:
     # ------------------------------------------------------------------ #
     # Repetition / hashing
     # ------------------------------------------------------------------ #
+    def _compute_zhash(self) -> int:
+        """Compute the full Zobrist hash from scratch (XOR of all pieces + side).
+
+        Used to (re)initialize the incremental hash in reset/from_fen/clone;
+        make_move/undo_move then maintain it in O(1).
+        """
+        h = 0
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                pc = self._grid[row][col]
+                if pc is not None:
+                    h ^= ZOBRIST_PIECE[_sq_index(row, col)][_piece_kind(pc)]
+        if self._side is Color.BLACK:
+            h ^= ZOBRIST_SIDE
+        return h
+
     def position_key(self) -> str:
         """Compact, hashable description of placement + side to move.
 
@@ -320,7 +378,7 @@ class Board:
 
     def repetition_count(self) -> int:
         """How many times the current position has occurred in this game."""
-        return self._pos_counts[self._keys[-1]] if self._keys else 1
+        return self._zcounts[self._zstack[-1]] if self._zstack else 1
 
     def __hash__(self) -> int:
         return hash(self.position_key())
@@ -342,8 +400,8 @@ class Board:
         new._fullmove = self._fullmove
         new._halfmove = self._halfmove
         new._king_pos = dict(self._king_pos)
-        new._keys = list(self._keys)
-        new._pos_counts = Counter(self._pos_counts)
+        new._zstack = list(self._zstack)
+        new._zcounts = Counter(self._zcounts)
         new._history = list(self._history)
         return new
 
@@ -424,8 +482,9 @@ class Board:
         board._side = side
         board._halfmove = halfmove
         board._fullmove = fullmove
-        board._keys = [board.position_key()]
-        board._pos_counts = Counter({board._keys[0]: 1})
+        z = board._compute_zhash()
+        board._zstack = [z]
+        board._zcounts = Counter({z: 1})
         board._history = []
         return board
 
