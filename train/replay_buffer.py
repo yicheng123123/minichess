@@ -97,10 +97,11 @@ class ReplayBuffer:
     ) -> int:
         """Populate the buffer from a :class:`SelfPlayDataset` JSONL store.
 
-        Games are read in order and added via :meth:`add_game`. If ``max_games``
-        is given, only the most recent ``max_games`` games are loaded (useful to
-        keep the buffer focused on fresh experience); otherwise every game in
-        the dataset is loaded.
+        Streams the dataset once via :meth:`SelfPlayDataset.iter_games` (a
+        single O(n) pass). If ``max_games`` is given, only the most recent
+        ``max_games`` games are loaded (a rolling window, useful to keep the
+        buffer focused on fresh experience); otherwise every game is loaded.
+        The buffer's own ``max_size`` still caps the total samples retained.
 
         Args:
             dataset: The on-disk self-play dataset to read from.
@@ -109,25 +110,20 @@ class ReplayBuffer:
         Returns:
             The number of games actually loaded.
         """
-        total = dataset.num_games()
-        if total == 0:
-            return 0
+        if max_games is None:
+            loaded = 0
+            for game in dataset.iter_games():
+                self.add_game(game)
+                loaded += 1
+            return loaded
 
-        if max_games is None or max_games >= total:
-            start, count = 0, total
-        else:
-            # Load the most recent ``max_games`` games.
-            start, count = total - max_games, max_games
-
-        loaded = 0
-        for index in range(start, start + count):
-            try:
-                game = dataset.get_game(index)
-            except IndexError:
-                break
+        # Keep only the most recent ``max_games`` games via a rolling window.
+        recent: "deque[List[SelfPlaySample]]" = deque(maxlen=max_games)
+        for game in dataset.iter_games():
+            recent.append(game)
+        for game in recent:
             self.add_game(game)
-            loaded += 1
-        return loaded
+        return len(recent)
 
     # ------------------------------------------------------------------ #
     # Persistence

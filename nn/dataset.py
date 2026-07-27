@@ -132,6 +132,24 @@ class SelfPlayDataset:
                 for s in record.get("samples", []):
                     yield SelfPlaySample.from_dict(s)
 
+    def iter_games(self) -> Iterator[List[SelfPlaySample]]:
+        """Yield each game's samples (as a list), streaming the file once.
+
+        Prefer this over repeatedly calling :meth:`get_game` when walking many
+        games: ``get_game`` re-scans the file from the top for each index
+        (O(n^2) overall), whereas this makes a single O(n) pass.
+        """
+        if not os.path.exists(self.path):
+            return
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                yield [SelfPlaySample.from_dict(s)
+                       for s in record.get("samples", [])]
+
     def num_games(self) -> int:
         """Count of stored games (lines in the file)."""
         if not os.path.exists(self.path):

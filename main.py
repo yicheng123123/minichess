@@ -155,6 +155,7 @@ def cmd_train(args) -> int:
         eval_every=args.eval_every,
         warm_start=args.warm_start,
         warm_start_epochs=args.warm_start_epochs,
+        fresh_buffer=args.fresh_buffer,
         resume=not args.no_resume,
     )
     return 0
@@ -361,6 +362,10 @@ def main() -> int:
     p_train.add_argument("--no-resume", action="store_true",
                          help="start from scratch instead of resuming from the "
                               "latest checkpoint")
+    p_train.add_argument("--fresh-buffer", action="store_true",
+                         help="resume the network but start the replay buffer "
+                              "empty (skip re-reading the on-disk dataset); ideal "
+                              "for a warm-start run")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")

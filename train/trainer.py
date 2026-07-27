@@ -311,6 +311,7 @@ class Trainer:
         curriculum: bool = True,
         warm_start: Optional[str] = None,
         warm_start_epochs: int = 2,
+        fresh_buffer: bool = False,
     ) -> Any:
         """Run the AlphaZero self-play training loop.
 
@@ -336,6 +337,11 @@ class Trainer:
                 the self-play loop begins.
             warm_start_epochs: Number of pretraining passes over the expert
                 data (keep small, e.g. 2-3, to avoid imitation learning).
+            fresh_buffer: If True (and resuming), load the network weights from
+                the checkpoint but do NOT warm the replay buffer from the
+                on-disk dataset. Useful for a warm-start run that should begin
+                from a clean buffer (expert data + new self-play only) instead
+                of re-reading a large, draw-heavy dataset.
 
         Returns:
             The trained network.
@@ -352,10 +358,14 @@ class Trainer:
             if latest is not None:
                 start_iter = latest + 1
                 logger.info(f"Resumed from checkpoint at iteration {latest}")
-                # Warm the buffer from persisted self-play data, if any.
-                loaded = self.buffer.load_from_dataset(self.dataset)
-                logger.info(f"Replay buffer warmed with {loaded} games "
-                            f"({len(self.buffer)} samples)")
+                if fresh_buffer:
+                    logger.info("Fresh buffer requested; skipping replay warm-up "
+                                "from the on-disk dataset")
+                else:
+                    # Warm the buffer from persisted self-play data, if any.
+                    loaded = self.buffer.load_from_dataset(self.dataset)
+                    logger.info(f"Replay buffer warmed with {loaded} games "
+                                f"({len(self.buffer)} samples)")
 
         # Optional warm-start: pretrain on expert data to give the value head
         # its first real win/loss signal, then seed the buffer with it.
