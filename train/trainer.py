@@ -309,6 +309,8 @@ class Trainer:
         resume: bool = True,
         num_workers: Optional[int] = None,
         curriculum: bool = True,
+        warm_start: Optional[str] = None,
+        warm_start_epochs: int = 2,
     ) -> Any:
         """Run the AlphaZero self-play training loop.
 
@@ -327,6 +329,13 @@ class Trainer:
                 iteration are always evaluated regardless.
             seed: Optional base seed for reproducibility.
             resume: If True, resume from the latest checkpoint when present.
+            warm_start: Optional path to an expert JSONL file (see
+                selfplay/expert.py). When given, the network is pretrained on
+                it (value on all positions, policy on teacher positions only)
+                and the expert samples are seeded into the replay buffer before
+                the self-play loop begins.
+            warm_start_epochs: Number of pretraining passes over the expert
+                data (keep small, e.g. 2-3, to avoid imitation learning).
 
         Returns:
             The trained network.
@@ -347,6 +356,23 @@ class Trainer:
                 loaded = self.buffer.load_from_dataset(self.dataset)
                 logger.info(f"Replay buffer warmed with {loaded} games "
                             f"({len(self.buffer)} samples)")
+
+        # Optional warm-start: pretrain on expert data to give the value head
+        # its first real win/loss signal, then seed the buffer with it.
+        if warm_start:
+            from train.warmstart import (
+                pretrain_from_expert, load_expert_samples,
+                expert_to_selfplay_samples,
+            )
+            pretrain_from_expert(
+                self.net, warm_start, epochs=warm_start_epochs,
+                batch_size=batch_size, lr=lr, device=self.device,
+            )
+            expert_raw = load_expert_samples(warm_start)
+            expert_samples = expert_to_selfplay_samples(expert_raw)
+            self.buffer.add_game(expert_samples)
+            logger.info(f"Seeded replay buffer with {len(expert_samples)} expert "
+                        f"samples; buffer={len(self.buffer)} samples")
 
         optimizer = self._create_optimizer(self.net, lr)
         logger.info(
@@ -401,6 +427,17 @@ class Trainer:
                 f"win_rate={win_rate:.2f} draw_rate={draw_rate:.2f} "
                 f"avg_plies={avg_plies:.0f} "
                 f"sims={cur_sims}; buffer={len(self.buffer)} samples"
+            )
+
+            # Replay buffer outcome composition (is decisive data accumulating?).
+            comp = self.buffer.value_composition()
+            tot = comp["total"] or 1
+            logger.info(
+                f"[iter {it}] buffer mix: "
+                f"win={100*comp['win']/tot:.1f}% "
+                f"loss={100*comp['loss']/tot:.1f}% "
+                f"draw={100*comp['draw']/tot:.1f}% "
+                f"(of {comp['total']} samples)"
             )
 
             # 2. Train: run epochs_per_iter gradient steps on sampled batches.

@@ -20,9 +20,12 @@ Thumbs.db
 
 # Project data (large/generated)
 data/games/*.jsonl
+data/expert/*.jsonl
 data/replay/*
 data/weights/*
 models/*.pt
+models/loss_curve.png
+models/loss_history.json
 
 # Keep directory structure
 !data/**/.gitkeep

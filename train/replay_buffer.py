@@ -159,6 +159,26 @@ class ReplayBuffer:
         self._buffer = deque(state.get("samples", []), maxlen=self.max_size)
 
     # ------------------------------------------------------------------ #
+    # Composition diagnostics
+    # ------------------------------------------------------------------ #
+    def value_composition(self) -> dict:
+        """Count win/loss/draw samples currently in the buffer by value sign.
+
+        Returns:
+            ``{"win", "loss", "draw", "total"}`` integer counts.
+        """
+        win = loss = draw = 0
+        for s in self._buffer:
+            if s.value > 0:
+                win += 1
+            elif s.value < 0:
+                loss += 1
+            else:
+                draw += 1
+        return {"win": win, "loss": loss, "draw": draw,
+                "total": win + loss + draw}
+
+    # ------------------------------------------------------------------ #
     # Dunder helpers
     # ------------------------------------------------------------------ #
     def clear(self) -> None:

@@ -6,9 +6,11 @@ Subcommands:
     python main.py search      # let alpha-beta pick a move from the start
     python main.py mcts        # let MCTS pick a move from the start
     python main.py selfplay    # generate self-play games (MCTS + network)
+    python main.py expert      # generate expert (AB vs AB) games for warm-start
     python main.py train       # run the full AlphaZero training loop
     python main.py api         # start the FastAPI server
     python main.py viz         # render a board position to PNG
+    python main.py compare     # play two checkpoints head-to-head
     python main.py test        # run the unittest suite
 
 The CLI has no required third-party dependencies for ``search`` / ``test``;
@@ -107,6 +109,24 @@ def cmd_selfplay(args) -> int:
     return 0
 
 
+def cmd_expert(args) -> int:
+    from selfplay.expert import generate_expert_games
+
+    outcomes = generate_expert_games(
+        n_games=args.games,
+        out_path=args.out,
+        depth_high=args.depth_high,
+        depth_low=args.depth_low,
+        max_plies=args.max_plies,
+        seed=args.seed,
+        augment=not args.no_augment,
+    )
+    decisive = sum(1 for o in outcomes if o != 0)
+    print(f"generated {len(outcomes)} expert games ({decisive} decisive) -> {args.out}")
+    print(f"use them with: python main.py train --warm-start {args.out}")
+    return 0
+
+
 def cmd_train(args) -> int:
     from train.trainer import Trainer
     from utils.config import get_config
@@ -119,7 +139,10 @@ def cmd_train(args) -> int:
     if args.dirichlet_alpha is not None:
         cfg.dirichlet_alpha = args.dirichlet_alpha
 
-    trainer = Trainer(accept_threshold=args.accept_threshold)
+    trainer = Trainer(
+        accept_threshold=args.accept_threshold,
+        replay_buffer_size=args.buffer_size,
+    )
     trainer.train(
         iterations=args.iterations,
         games_per_iter=args.games,
@@ -129,6 +152,9 @@ def cmd_train(args) -> int:
         num_workers=args.workers,
         evaluate_games=args.eval_games,
         eval_every=args.eval_every,
+        warm_start=args.warm_start,
+        warm_start_epochs=args.warm_start_epochs,
+        resume=not args.no_resume,
     )
     return 0
 
@@ -278,6 +304,22 @@ def main() -> int:
     p_sp.add_argument("--use-net", action="store_true",
                       help="use the trained network (if available)")
 
+    # --- expert ---
+    p_exp = sub.add_parser("expert",
+                           help="generate expert (AB vs AB) games for warm-start")
+    p_exp.add_argument("--games", type=int, default=100,
+                       help="number of expert games to generate (default: 100)")
+    p_exp.add_argument("--depth-high", type=int, default=3,
+                       help="search depth of the stronger/teacher side (default: 3)")
+    p_exp.add_argument("--depth-low", type=int, default=2,
+                       help="search depth of the weaker side (default: 2)")
+    p_exp.add_argument("--max-plies", type=int, default=200)
+    p_exp.add_argument("--out", default="data/expert/expert.jsonl",
+                       help="output expert JSONL path")
+    p_exp.add_argument("--seed", type=int, default=0)
+    p_exp.add_argument("--no-augment", action="store_true",
+                       help="disable horizontal-flip augmentation")
+
     # --- train ---
     p_train = sub.add_parser("train", help="run the AlphaZero training loop")
     p_train.add_argument("--iterations", type=int, default=10)
@@ -304,6 +346,17 @@ def main() -> int:
                          help="arena score rate needed to promote a new best model "
                               "(default: 0.55; lower to 0.5 to let drawn matches "
                               "promote too)")
+    p_train.add_argument("--warm-start", default=None,
+                         help="path to an expert JSONL file (from `main.py expert`) "
+                              "to pretrain on before self-play")
+    p_train.add_argument("--warm-start-epochs", type=int, default=2,
+                         help="pretraining passes over the expert data (default: 2)")
+    p_train.add_argument("--buffer-size", type=int, default=100_000,
+                         help="replay buffer capacity (default: 100000; lower to "
+                              "~10000-20000 to drop stale draw-heavy data faster)")
+    p_train.add_argument("--no-resume", action="store_true",
+                         help="start from scratch instead of resuming from the "
+                              "latest checkpoint")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")
@@ -336,6 +389,7 @@ def main() -> int:
         "search": cmd_search,
         "mcts": cmd_mcts,
         "selfplay": cmd_selfplay,
+        "expert": cmd_expert,
         "train": cmd_train,
         "api": cmd_api,
         "viz": cmd_viz,
