@@ -44,10 +44,11 @@ from typing import List, Optional
 import numpy as np
 
 from engine.board import Board
-from engine.move_generator import legal_moves
+from engine.move_generator import legal_moves, in_check
 from engine.piece import Color
 from engine.rules import game_result, GameOutcome
 from search.alphabeta import alphabeta
+from search.evaluation import evaluate
 from nn.network import move_to_index, NUM_MOVE_ACTIONS
 from nn.dataset import encode_planes, decode_planes
 from selfplay.player import _mirror_planes, _mirror_policy
@@ -270,4 +271,200 @@ def generate_expert_games(
     logger.info(f"Generated {n_games} expert games: "
                 f"Red={red} Black={black} Draw={draws} "
                 f"({decisive} decisive) terminal[{reason_summary}] -> {out_path}")
+    return outcomes
+
+
+# --------------------------------------------------------------------------- #
+# Advantage Curriculum (Tier 2): teach the policy to CONVERT an advantage.
+# --------------------------------------------------------------------------- #
+def _eval_for(board: Board, color: Color) -> float:
+    """Static eval from ``color``'s perspective (evaluate() is side-to-move)."""
+    e = evaluate(board)
+    return e if board.side_to_move is color else -e
+
+
+def _is_forcing(board: Board, move) -> bool:
+    """Whether ``move`` is a forcing move: a capture or a check."""
+    if board.piece_at(move.to_row, move.to_col) is not None:
+        return True
+    b2 = board.clone()
+    b2.make_move(move)
+    return in_check(b2, board.side_to_move.opponent)
+
+
+def play_advantage_game(
+    depth_high: int = 3,
+    depth_low: int = 2,
+    high_plays_red: bool = True,
+    max_plies: int = 200,
+    seed: Optional[int] = None,
+    random_opening_plies: int = 8,
+    opponent: str = "egreedy",
+    epsilon: float = 0.2,
+    advantage_threshold: float = 2.0,
+) -> dict:
+    """Play one AB game and extract "advantage conversion" training samples.
+
+    The full trajectory is recorded with a running static eval (Red-positive)
+    and a per-move ``forcing`` flag (capture or check). Once the game is known
+    to be decisive with winner ``W``, every position where ``W``'s advantage
+    (eval from ``W``'s perspective) is at least ``advantage_threshold`` is an
+    *advantage-phase* position. For ``W``'s moves in those positions we emit a
+    sample whose ``teacher`` flag is set only on **forcing** moves, so the
+    warm-start policy loss imitates checks/captures (making progress) and never
+    the quiet shuffling moves. Value targets are the game outcome (+/-1) from
+    the mover's perspective; because only decisive games contribute, there are
+    no draw-0 labels to collapse the value head.
+
+    Returns ``{"samples", "outcome", "plies", "reason", "n_teacher"}``; an
+    drawn/unfinished game yields an empty ``samples`` list.
+    """
+    if seed is not None:
+        random.seed(seed)
+    board = Board()
+    high_color = Color.RED if high_plays_red else Color.BLACK
+
+    # Randomized opening (not recorded) to diversify the games.
+    opening = 0
+    while opening < random_opening_plies:
+        if game_result(board) is not None:
+            break
+        mvs = legal_moves(board)
+        if not mvs:
+            break
+        board.make_move(random.choice(mvs))
+        opening += 1
+
+    # Record (planes, move, mover, eval_red, forcing) for the whole game.
+    history: List[tuple] = []
+    ply = opening
+    while ply < max_plies:
+        if game_result(board) is not None:
+            break
+        mover = board.side_to_move
+        eval_red = _eval_for(board, Color.RED)
+        if mover is high_color:
+            _score, move = alphabeta(board, depth=depth_high)
+        elif opponent == "random":
+            move = random.choice(legal_moves(board))
+        elif opponent == "egreedy" and random.random() < epsilon:
+            move = random.choice(legal_moves(board))
+        else:
+            _score, move = alphabeta(board, depth=depth_low)
+        if move is None:
+            break
+        forcing = _is_forcing(board, move)
+        history.append((board.to_planes(), move, mover, eval_red, forcing))
+        board.make_move(move)
+        ply += 1
+
+    result = game_result(board)
+    reason = "max_plies" if result is None else result.reason
+    if result is None or result.outcome is GameOutcome.DRAW:
+        return {"samples": [], "outcome": 0, "plies": ply, "reason": reason,
+                "n_teacher": 0}
+    if result.outcome is GameOutcome.RED_WINS:
+        outcome, winner = 1, Color.RED
+    else:
+        outcome, winner = -1, Color.BLACK
+
+    samples = []
+    n_teacher = 0
+    for planes, move, mover, eval_red, forcing in history:
+        adv = eval_red if winner is Color.RED else -eval_red
+        if adv < advantage_threshold:
+            continue                      # not yet in an advantage phase
+        if mover is not winner:
+            continue                      # only teach the converter's choices
+        value = float(outcome) if mover is Color.RED else float(-outcome)
+        teacher = forcing                 # policy learns only forcing moves
+        if teacher:
+            n_teacher += 1
+        samples.append({
+            "planes": encode_planes(planes),
+            "policy": _one_hot_policy(move).tolist(),
+            "value": value,
+            "move": move.uci(),
+            "teacher": teacher,
+        })
+    return {"samples": samples, "outcome": outcome, "plies": ply,
+            "reason": reason, "n_teacher": n_teacher}
+
+
+def generate_advantage_games(
+    n_games: int,
+    out_path: str,
+    depth_high: int = 3,
+    depth_low: int = 2,
+    max_plies: int = 200,
+    seed: int = 0,
+    augment: bool = True,
+    random_opening_plies: int = 8,
+    opponent: str = "egreedy",
+    epsilon: float = 0.2,
+    epsilon_jitter: bool = True,
+    advantage_threshold: float = 2.0,
+) -> List[int]:
+    """Generate Advantage-Curriculum games (Tier 2) and append to ``out_path``.
+
+    Each decisive game contributes the winner's advantage-phase positions; the
+    policy is taught only the forcing moves among them. See
+    :func:`play_advantage_game` for the labeling rule.
+    """
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    _JITTER = random.Random(seed)
+    outcomes: List[int] = []
+    reason_counts: dict = {}
+    total_samples = 0
+    total_teacher = 0
+    decisive = 0
+    with open(out_path, "a", encoding="utf-8") as f:
+        for i in range(n_games):
+            high_plays_red = (i % 2 == 0)
+            eps = epsilon
+            if epsilon_jitter and opponent == "egreedy":
+                eps = _JITTER.choice((0.1, 0.2, 0.3))
+            game = play_advantage_game(
+                depth_high=depth_high, depth_low=depth_low,
+                high_plays_red=high_plays_red, max_plies=max_plies,
+                seed=seed + i, random_opening_plies=random_opening_plies,
+                opponent=opponent, epsilon=eps,
+                advantage_threshold=advantage_threshold,
+            )
+            samples = game["samples"]
+            outcomes.append(game["outcome"])
+            reason_counts[game["reason"]] = reason_counts.get(game["reason"], 0) + 1
+            if not samples:
+                res = {1: "red", -1: "black"}.get(game["outcome"], "draw")
+                logger.info(f"  advantage game {i+1}/{n_games}: {res} "
+                            f"({game['plies']} plies, {game['reason']}) — no advantage "
+                            f"samples (decided before an advantage phase), skipped")
+                continue
+            if augment:
+                samples = samples + [_mirror_expert_sample(s) for s in samples]
+            record = {"samples": samples, "outcome": game["outcome"],
+                      "plies": game["plies"], "reason": game["reason"]}
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            decisive += 1
+            total_samples += len(samples)
+            total_teacher += game["n_teacher"] * (2 if augment else 1)
+            logger.info(f"  advantage game {i+1}/{n_games}: "
+                        f"{'red' if game['outcome'] > 0 else 'black'} "
+                        f"({game['plies']} plies, {len(samples)} samples, "
+                        f"{game['n_teacher']*(2 if augment else 1)} forcing teacher, "
+                        f"{game['reason']})")
+
+    red = outcomes.count(1)
+    black = outcomes.count(-1)
+    draws = outcomes.count(0)
+    reason_summary = ", ".join(f"{k}={v}" for k, v in
+                               sorted(reason_counts.items(), key=lambda kv: -kv[1]))
+    logger.info(f"Generated {n_games} advantage games: "
+                f"Red={red} Black={black} Draw={draws} "
+                f"({decisive} decisive w/ samples) terminal[{reason_summary}] "
+                f"samples={total_samples} forcing_teacher={total_teacher} "
+                f"-> {out_path}")
     return outcomes

@@ -131,6 +131,30 @@ def cmd_expert(args) -> int:
     return 0
 
 
+def cmd_advantage(args) -> int:
+    from selfplay.expert import generate_advantage_games
+
+    outcomes = generate_advantage_games(
+        n_games=args.games,
+        out_path=args.out,
+        depth_high=args.depth_high,
+        depth_low=args.depth_low,
+        max_plies=args.max_plies,
+        seed=args.seed,
+        augment=not args.no_augment,
+        random_opening_plies=args.opening_plies,
+        opponent=args.opponent,
+        epsilon=args.epsilon,
+        epsilon_jitter=args.epsilon_jitter,
+        advantage_threshold=args.advantage_threshold,
+    )
+    decisive = sum(1 for o in outcomes if o != 0)
+    print(f"generated {len(outcomes)} advantage-curriculum games "
+          f"({decisive} decisive) -> {args.out}")
+    print(f"use them with: python main.py train --warm-start {args.out}")
+    return 0
+
+
 def cmd_train(args) -> int:
     from train.trainer import Trainer
     from utils.config import get_config
@@ -342,6 +366,30 @@ def main() -> int:
                        help="with --opponent egreedy, draw each game's epsilon "
                             "from {0.1,0.2,0.3} instead of a fixed value")
 
+    # --- advantage (Tier-2 curriculum) ---
+    p_adv = sub.add_parser("advantage",
+                           help="generate Advantage-Curriculum games (Tier 2): "
+                                "teach the policy to convert an advantage")
+    p_adv.add_argument("--games", type=int, default=100)
+    p_adv.add_argument("--depth-high", type=int, default=3,
+                       help="teacher (winner) search depth (default: 3)")
+    p_adv.add_argument("--depth-low", type=int, default=2)
+    p_adv.add_argument("--max-plies", type=int, default=200)
+    p_adv.add_argument("--out", default="data/expert/advantage.jsonl",
+                       help="output JSONL path")
+    p_adv.add_argument("--seed", type=int, default=0)
+    p_adv.add_argument("--no-augment", action="store_true")
+    p_adv.add_argument("--opening-plies", type=int, default=8)
+    p_adv.add_argument("--opponent", choices=["ab", "random", "egreedy"],
+                       default="egreedy",
+                       help="opponent the teacher plays against (default: egreedy)")
+    p_adv.add_argument("--epsilon", type=float, default=0.2)
+    p_adv.add_argument("--epsilon-jitter", action="store_true",
+                       help="draw each game's epsilon from {0.1,0.2,0.3}")
+    p_adv.add_argument("--advantage-threshold", type=float, default=2.0,
+                       help="cut advantage phases when the winner's AB eval lead "
+                            "reaches this (in soldier=1 units; default: 2.0)")
+
     # --- train ---
     p_train = sub.add_parser("train", help="run the AlphaZero training loop")
     p_train.add_argument("--iterations", type=int, default=10)
@@ -423,6 +471,7 @@ def main() -> int:
         "mcts": cmd_mcts,
         "selfplay": cmd_selfplay,
         "expert": cmd_expert,
+        "advantage": cmd_advantage,
         "train": cmd_train,
         "api": cmd_api,
         "viz": cmd_viz,
