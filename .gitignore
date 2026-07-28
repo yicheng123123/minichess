@@ -24,9 +24,17 @@ data/expert/*.jsonl
 data/replay/*
 data/weights/*
 models/*.pt
+models/*.csv
 models/loss_curve.png
 models/loss_history.json
 
 # Keep directory structure
 !data/**/.gitkeep
 !models/.gitkeep
+
+# Run logs
+*.log
+
+# Experiment diagnostic dumps (raw console captures, not curated records).
+# Curated record dirs such as experiments/exp1_warmstart_only/ are kept.
+experiments/*.txt
