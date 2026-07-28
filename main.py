@@ -121,6 +121,9 @@ def cmd_expert(args) -> int:
         seed=args.seed,
         augment=not args.no_augment,
         random_opening_plies=args.opening_plies,
+        opponent=args.opponent,
+        epsilon=args.epsilon,
+        epsilon_jitter=args.epsilon_jitter,
     )
     decisive = sum(1 for o in outcomes if o != 0)
     print(f"generated {len(outcomes)} expert games ({decisive} decisive) -> {args.out}")
@@ -326,6 +329,18 @@ def main() -> int:
     p_exp.add_argument("--opening-plies", type=int, default=8,
                        help="random opening half-moves before alpha-beta plays, "
                             "to make each game unique (default: 8)")
+    p_exp.add_argument("--opponent", choices=["ab", "random", "egreedy"],
+                       default="ab",
+                       help="weaker side: 'ab'=alpha-beta(depth-low), "
+                            "'random'=random moves (many short mates), "
+                            "'egreedy'=mostly alpha-beta but occasionally random "
+                            "(defender that blunders; closest to self-play)")
+    p_exp.add_argument("--epsilon", type=float, default=0.2,
+                       help="random-move probability for the egreedy opponent "
+                            "(default: 0.2)")
+    p_exp.add_argument("--epsilon-jitter", action="store_true",
+                       help="with --opponent egreedy, draw each game's epsilon "
+                            "from {0.1,0.2,0.3} instead of a fixed value")
 
     # --- train ---
     p_train = sub.add_parser("train", help="run the AlphaZero training loop")

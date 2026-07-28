@@ -359,6 +359,35 @@ class Trainer:
         v = value.detach().cpu()
         return float(v.mean().item()), float(v.std().item())
 
+    def _policy_entropy(self, games: List[List[SelfPlaySample]], n: int = 256) -> float:
+        """Mean entropy of the MCTS root policy targets generated this iteration.
+
+        Each self-play sample stores the MCTS visit-count distribution (a soft
+        policy target). Its entropy measures how decisive the search is: low
+        entropy means visits concentrate on one/few moves (the policy "knows"),
+        while persistently high entropy means the policy is still diffuse.
+        Averaged over a subsample of this iteration's positions for speed.
+        """
+        import math
+        import random as _random
+        import numpy as np
+
+        pols = [s.policy for game in games for s in game]
+        if not pols:
+            return 0.0
+        if len(pols) > n:
+            pols = _random.sample(pols, n)
+        entropies = []
+        for p in pols:
+            arr = np.asarray(p, dtype=np.float64)
+            arr = arr[arr > 0]
+            if arr.size == 0:
+                entropies.append(0.0)
+                continue
+            arr = arr / arr.sum()
+            entropies.append(float(-(arr * np.log(arr)).sum()))
+        return sum(entropies) / len(entropies)
+
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
@@ -495,7 +524,7 @@ class Trainer:
 
             # 1. Self-play: generate games in parallel, push into buffer + dataset.
             adapter = _GameCollectingDataset(self.dataset)
-            outcomes, plies = generate_games_parallel(
+            outcomes, plies, reasons, first_reps = generate_games_parallel(
                 adapter,
                 games_per_iter,
                 net=self.net,
@@ -517,12 +546,28 @@ class Trainer:
             win_rate = (red + black) / n_games_done if n_games_done else 0.0
             draw_rate = draws / n_games_done if n_games_done else 0.0
             avg_plies = sum(plies) / len(plies) if plies else 0.0
+
+            # Terminal-reason breakdown: is the agent learning to FINISH (mate)
+            # rather than shuffle into repetition draws?
+            mate_rate = reasons.count("checkmate") / n_games_done if n_games_done else 0.0
+            repetition_rate = reasons.count("repetition") / n_games_done if n_games_done else 0.0
+            maxplies_rate = reasons.count("max_plies") / n_games_done if n_games_done else 0.0
+            reps_only = [p for p in first_reps if p is not None]
+            mean_first_rep = sum(reps_only) / len(reps_only) if reps_only else 0.0
+
             logger.info(
                 f"[iter {it}] self-play: {n_games_done} games "
                 f"(red={red} black={black} draw={draws}) "
                 f"win_rate={win_rate:.2f} draw_rate={draw_rate:.2f} "
                 f"avg_plies={avg_plies:.0f} "
                 f"sims={cur_sims}; buffer={len(self.buffer)} samples"
+            )
+            logger.info(
+                f"[iter {it}] terminal: mate={100*mate_rate:.0f}% "
+                f"repetition={100*repetition_rate:.0f}% "
+                f"max_plies={100*maxplies_rate:.0f}% "
+                f"first_rep_ply={mean_first_rep:.0f} "
+                f"(of {len(reps_only)} games w/ repetition)"
             )
 
             # Replay buffer outcome composition (is decisive data accumulating?).
@@ -564,6 +609,15 @@ class Trainer:
                 f"std={value_std:.3f}"
             )
 
+            # Policy health: entropy of the MCTS root policy targets. Falling
+            # entropy means the policy is growing decisive; stuck-high entropy
+            # means it still doesn't "know" what to play.
+            policy_entropy = self._policy_entropy(adapter.games)
+            logger.info(
+                f"[iter {it}] policy entropy: {policy_entropy:.3f} "
+                f"(lower = more decisive)"
+            )
+
             # Record a full metrics row for experiment analysis (CSV export).
             metrics_rows.append({
                 "iteration": it,
@@ -576,6 +630,11 @@ class Trainer:
                 "win_rate": win_rate,
                 "draw_rate": draw_rate,
                 "avg_plies": avg_plies,
+                "mate_rate": mate_rate,
+                "repetition_rate": repetition_rate,
+                "maxplies_rate": maxplies_rate,
+                "first_rep_ply": mean_first_rep,
+                "policy_entropy": policy_entropy,
                 "selfplay_win_pct": 100 * comp["win"] / tot,
                 "selfplay_draw_pct": 100 * comp["draw"] / tot,
                 "sims": cur_sims,

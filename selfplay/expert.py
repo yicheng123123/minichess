@@ -70,12 +70,15 @@ def play_expert_game(
     max_plies: int = 200,
     seed: Optional[int] = None,
     random_opening_plies: int = 8,
+    opponent: str = "ab",
+    epsilon: float = 0.0,
 ) -> dict:
-    """Play one AB(depth_high) vs AB(depth_low) game and collect raw samples.
+    """Play one AB(depth_high) vs <opponent> game and collect raw samples.
 
     Args:
         depth_high: Search depth of the stronger ("teacher") side.
-        depth_low: Search depth of the weaker side.
+        depth_low: Search depth of the weaker side (used when ``opponent`` is
+            ``"ab"``, or as the non-random branch of ``"egreedy"``).
         high_plays_red: Whether the stronger side plays Red (alternate this
             across games so the teacher covers both colors).
         max_plies: Cap on half-moves before the game is scored a draw.
@@ -86,10 +89,19 @@ def play_expert_game(
             identical; a randomized (but seeded) opening gives each game a
             distinct trajectory. These opening plies are not recorded as
             training data — recording starts once alpha-beta plays.
+        opponent: How the weaker (non-teacher) side plays. ``"ab"`` (default)
+            uses alpha-beta at ``depth_low``; ``"random"`` plays uniformly random
+            legal moves (yields many short, clean mates — a "finishing" course);
+            ``"egreedy"`` plays a random move with probability ``epsilon`` and
+            otherwise alpha-beta(depth_low) — a defender that also blunders,
+            whose distribution is closest to future self-play.
+        epsilon: Random-move probability for the ``"egreedy"`` opponent.
 
     Returns:
-        ``{"samples": [...], "outcome": int, "plies": int}`` where each sample
-        is a dict with planes/policy/value/move/teacher (see module docstring).
+        ``{"samples": [...], "outcome": int, "plies": int, "reason": str}``
+        where each sample is a dict with planes/policy/value/move/teacher (see
+        module docstring) and ``reason`` is the terminal reason
+        (``"checkmate"``/``"no_legal_moves"``/``"repetition"``/``"max_plies"``).
     """
     if seed is not None:
         random.seed(seed)
@@ -114,8 +126,16 @@ def play_expert_game(
         if game_result(board) is not None:
             break
         mover = board.side_to_move
-        depth = depth_high if mover is high_color else depth_low
-        _score, move = alphabeta(board, depth=depth)
+        if mover is high_color:
+            # Teacher side: always full-strength alpha-beta.
+            _score, move = alphabeta(board, depth=depth_high)
+        elif opponent == "random":
+            move = random.choice(legal_moves(board))
+        elif opponent == "egreedy" and random.random() < epsilon:
+            move = random.choice(legal_moves(board))
+        else:
+            # "ab" opponent, or the (1-epsilon) branch of "egreedy".
+            _score, move = alphabeta(board, depth=depth_low)
         if move is None:
             break
         history.append((board.to_planes(), move, mover))
@@ -124,6 +144,10 @@ def play_expert_game(
 
     # Score the game.
     result = game_result(board)
+    if result is None:
+        reason = "max_plies"
+    else:
+        reason = result.reason
     if result is None or result.outcome is GameOutcome.DRAW:
         outcome = 0
         winner = None
@@ -151,7 +175,7 @@ def play_expert_game(
             "teacher": (mover is teacher_side),
         })
 
-    return {"samples": samples, "outcome": outcome, "plies": ply}
+    return {"samples": samples, "outcome": outcome, "plies": ply, "reason": reason}
 
 
 def _mirror_expert_sample(sample: dict) -> dict:
@@ -177,12 +201,24 @@ def generate_expert_games(
     seed: int = 0,
     augment: bool = True,
     random_opening_plies: int = 8,
+    opponent: str = "ab",
+    epsilon: float = 0.2,
+    epsilon_jitter: bool = False,
 ) -> List[int]:
     """Play ``n_games`` expert games and append them to ``out_path`` (JSONL).
 
     The stronger side alternates color each game so the teacher covers both
     Red and Black. With ``augment`` each game also contributes a mirrored
     copy, roughly doubling the data.
+
+    Args:
+        opponent: Weaker-side policy forwarded to :func:`play_expert_game`
+            (``"ab"``/``"random"``/``"egreedy"``).
+        epsilon: Base random-move probability for the ``"egreedy"`` opponent.
+        epsilon_jitter: If True (and ``opponent == "egreedy"``), draw each game's
+            epsilon uniformly from ``{0.1, 0.2, 0.3}`` instead of using the fixed
+            ``epsilon``. A spread of opponent strengths keeps the teacher data
+            from being too narrow (future self-play opponents also vary).
 
     Returns:
         List of game outcomes (+1 Red wins, -1 Black wins, 0 draw).
@@ -191,11 +227,16 @@ def generate_expert_games(
     if parent:
         os.makedirs(parent, exist_ok=True)
 
+    _JITTER = random.Random(seed)
     outcomes: List[int] = []
+    reason_counts: dict = {}
     decisive = 0
     with open(out_path, "a", encoding="utf-8") as f:
         for i in range(n_games):
             high_plays_red = (i % 2 == 0)
+            eps = epsilon
+            if epsilon_jitter and opponent == "egreedy":
+                eps = _JITTER.choice((0.1, 0.2, 0.3))
             game = play_expert_game(
                 depth_high=depth_high,
                 depth_low=depth_low,
@@ -203,25 +244,30 @@ def generate_expert_games(
                 max_plies=max_plies,
                 seed=seed + i,
                 random_opening_plies=random_opening_plies,
+                opponent=opponent,
+                epsilon=eps,
             )
             samples = game["samples"]
             if augment:
                 samples = samples + [_mirror_expert_sample(s) for s in samples]
             record = {"samples": samples, "outcome": game["outcome"],
-                      "plies": game["plies"]}
+                      "plies": game["plies"], "reason": game["reason"]}
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             outcomes.append(game["outcome"])
+            reason_counts[game["reason"]] = reason_counts.get(game["reason"], 0) + 1
             if game["outcome"] != 0:
                 decisive += 1
             logger.info(f"  expert game {i+1}/{n_games}: "
                         f"{'red' if game['outcome'] > 0 else 'black' if game['outcome'] < 0 else 'draw'} "
-                        f"({game['plies']} plies, {len(samples)} samples)")
+                        f"({game['plies']} plies, {len(samples)} samples, {game['reason']})")
 
     red = outcomes.count(1)
     black = outcomes.count(-1)
     draws = outcomes.count(0)
+    reason_summary = ", ".join(f"{k}={v}" for k, v in
+                               sorted(reason_counts.items(), key=lambda kv: -kv[1]))
     logger.info(f"Generated {n_games} expert games: "
                 f"Red={red} Black={black} Draw={draws} "
-                f"({decisive} decisive) -> {out_path}")
+                f"({decisive} decisive) terminal[{reason_summary}] -> {out_path}")
     return outcomes

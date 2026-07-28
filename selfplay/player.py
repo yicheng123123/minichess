@@ -207,6 +207,7 @@ def play_game(
     history: List[Tuple["np.ndarray", "np.ndarray", str, Color]] = []
 
     ply = 0
+    first_rep_ply: Optional[int] = None
     while ply < max_plies:
         # Check for terminal state
         result = game_result(board)
@@ -243,17 +244,27 @@ def play_game(
         board.make_move(best_move)
         ply += 1
 
+        # Track the first time a position recurs (diagnostic: how late does the
+        # game first start repeating itself). A higher value means the agent is
+        # playing more purposefully before falling into a repetition loop.
+        if first_rep_ply is None and board.repetition_count() >= 2:
+            first_rep_ply = ply
+
     # Determine game outcome
     result = game_result(board)
     if result is None:
         # Max plies reached without terminal state — draw
         outcome = 0
+        reason = "max_plies"
     elif result.outcome == GameOutcome.RED_WINS:
         outcome = 1
+        reason = result.reason
     elif result.outcome == GameOutcome.BLACK_WINS:
         outcome = -1
+        reason = result.reason
     else:
         outcome = 0
+        reason = result.reason
 
     # Build samples with value from mover's perspective
     for planes, policy, move_uci, mover in history:
@@ -281,6 +292,8 @@ def play_game(
         "samples": samples,
         "outcome": outcome,
         "plies": ply,
+        "reason": reason,
+        "first_rep_ply": first_rep_ply,
     }
 
 
@@ -422,6 +435,8 @@ def _play_one_game_worker(args: dict) -> dict:
         "samples": result["samples"],
         "outcome": result["outcome"],
         "plies": result["plies"],
+        "reason": result["reason"],
+        "first_rep_ply": result["first_rep_ply"],
     }
 
 
@@ -484,9 +499,12 @@ def generate_games_parallel(
         **kwargs: Passed to play_game (max_plies, temperature, etc.).
 
     Returns:
-        A tuple ``(outcomes, plies)`` where ``outcomes`` is a list of game
-        results (+1 Red wins, -1 Black wins, 0 draw) and ``plies`` is a list
-        of the number of half-moves each game lasted.
+        A tuple ``(outcomes, plies, reasons, first_reps)`` where ``outcomes`` is
+        a list of game results (+1 Red wins, -1 Black wins, 0 draw), ``plies``
+        is the number of half-moves each game lasted, ``reasons`` is the
+        terminal reason per game (``"checkmate"``/``"no_legal_moves"``/
+        ``"repetition"``/``"king_captured"``/``"max_plies"``), and ``first_reps``
+        is the ply at which each game first repeated a position (or ``None``).
     """
     import os
     from concurrent.futures import as_completed
@@ -501,7 +519,7 @@ def generate_games_parallel(
         # RandomPolicyValueNet has no state_dict; fall back to serial.
         logger.info("Network has no state_dict; falling back to serial play.")
         serial_outcomes = generate_games(dataset, n_games, net, mcts, seed, augment, **kwargs)
-        return serial_outcomes, []
+        return serial_outcomes, [], [], []
 
     if net_kwargs is None:
         net_kwargs = {
@@ -534,6 +552,8 @@ def generate_games_parallel(
 
     outcomes: List[int] = []
     all_plies: List[int] = []
+    all_reasons: List[str] = []
+    all_first_reps: List[Optional[int]] = []
     all_samples: List = []
 
     executor = _get_pool(num_workers)
@@ -555,6 +575,8 @@ def generate_games_parallel(
 
         outcomes.append(outcome)
         all_plies.append(result["plies"])
+        all_reasons.append(result["reason"])
+        all_first_reps.append(result["first_rep_ply"])
         if done_count % max(1, n_games // 5) == 0 or done_count == n_games:
             logger.info(f"  self-play progress: {done_count}/{n_games} games done")
 
@@ -570,4 +592,4 @@ def generate_games_parallel(
         f"avg_plies={avg_plies:.0f}"
     )
 
-    return outcomes, all_plies
+    return outcomes, all_plies, all_reasons, all_first_reps
