@@ -388,6 +388,37 @@ class Trainer:
             entropies.append(float(-(arr * np.log(arr)).sum()))
         return sum(entropies) / len(entropies)
 
+    def _batch_material(self, batch: List[SelfPlaySample], n: int = 128) -> float:
+        """Mean total non-king material of batch positions (endgame-bias probe).
+
+        Decodes piece counts directly from the occupancy planes (channels 0-4
+        Red, 5-9 Black, piece order K,R,N,C,S) using the same weights as
+        :func:`search.evaluation.evaluate` (R=9, N=4, C=4.5, S=1, soldier
+        baseline; kings excluded as they are always one per side). A full board
+        totals 80 (each side 2R+2N+2C+5S = 40); a falling mean signals the
+        sampled data is skewing toward
+        endgames -- the advisor's concern that draw-filtering could starve the
+        policy of opening/middlegame positions even while it saves the value
+        head.
+        """
+        import random as _random
+        import numpy as np
+
+        if not batch:
+            return 0.0
+        subs = _random.sample(batch, min(n, len(batch)))
+        # Piece weights by channel offset within a color block (K,R,N,C,S).
+        w = np.array([0.0, 9.0, 4.0, 4.5, 1.0], dtype=np.float64)
+        totals = []
+        for s in subs:
+            pl = np.asarray(s.planes, dtype=np.float64)
+            if pl.ndim != 3 or pl.shape[0] < 10:
+                continue
+            red = float((pl[0:5].sum(axis=(1, 2)) * w).sum())
+            black = float((pl[5:10].sum(axis=(1, 2)) * w).sum())
+            totals.append(red + black)
+        return sum(totals) / len(totals) if totals else 0.0
+
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
@@ -410,6 +441,9 @@ class Trainer:
         fresh_buffer: bool = False,
         expert_replay: Optional[str] = None,
         expert_ratio: float = 0.25,
+        freeze_buffer: bool = False,
+        max_draw_frac: Optional[float] = None,
+        init_model: Optional[str] = None,
     ) -> Any:
         """Run the AlphaZero self-play training loop.
 
@@ -456,6 +490,16 @@ class Trainer:
 
         if evaluate_simulations is None:
             evaluate_simulations = self.config.num_simulations
+
+        # Optional: initialize the network from a pretrained model (e.g. a
+        # supervisedly-pretrained SL net) rather than random weights. Used by the
+        # engineering route's Phase 2 — start self-play from a competent policy.
+        if init_model:
+            import torch
+            state = torch.load(init_model, map_location=self.device)
+            self.net.load_state_dict(state)
+            self.net.to(self.device)
+            logger.info(f"Initialized network from pretrained model: {init_model}")
 
         start_iter = 0
         if resume:
@@ -523,21 +567,27 @@ class Trainer:
             self.mcts.num_simulations = cur_sims
 
             # 1. Self-play: generate games in parallel, push into buffer + dataset.
+            #    In the freeze_buffer ablation we skip generation entirely so the
+            #    buffer stays frozen at the warm-start data — isolating whether
+            #    value collapse comes from NEW self-play data vs training itself.
             adapter = _GameCollectingDataset(self.dataset)
-            outcomes, plies, reasons, first_reps = generate_games_parallel(
-                adapter,
-                games_per_iter,
-                net=self.net,
-                mcts=self.mcts,
-                seed=iter_seed,
-                num_workers=num_workers,
-                net_kwargs={
-                    "hidden": self.config.hidden_channels,
-                    "num_res_blocks": self.config.num_res_blocks,
-                },
-            )
-            for game in adapter.games:
-                self.buffer.add_game(game)
+            if freeze_buffer:
+                outcomes, plies, reasons, first_reps = [], [], [], []
+            else:
+                outcomes, plies, reasons, first_reps = generate_games_parallel(
+                    adapter,
+                    games_per_iter,
+                    net=self.net,
+                    mcts=self.mcts,
+                    seed=iter_seed,
+                    num_workers=num_workers,
+                    net_kwargs={
+                        "hidden": self.config.hidden_channels,
+                        "num_res_blocks": self.config.num_res_blocks,
+                    },
+                )
+                for game in adapter.games:
+                    self.buffer.add_game(game)
 
             red = outcomes.count(1)
             black = outcomes.count(-1)
@@ -587,10 +637,27 @@ class Trainer:
                 continue
 
             epoch_stats: List[Dict[str, float]] = []
+            batch_draw_fracs: List[float] = []
+            expert_fracs: List[float] = []
+            last_batch: List[SelfPlaySample] = []
             for _ in range(epochs_per_iter):
-                batch, sources = self.buffer.sample(batch_size, expert_ratio)
+                batch, sources = self.buffer.sample(batch_size, expert_ratio,
+                                                    max_draw_frac=max_draw_frac)
+                if batch:
+                    # Effective (actually-sampled) draw fraction -- verifies the
+                    # max_draw_frac cap binds in practice, not just in the buffer.
+                    batch_draw_fracs.append(
+                        sum(1 for s in batch if s.value == 0) / len(batch))
+                    expert_fracs.append(
+                        sum(1 for src in sources if src == "expert") / len(sources))
+                    last_batch = batch
                 stats = self.train_batch(batch, optimizer, sources=sources)
                 epoch_stats.append(stats)
+            eff_draw_frac = (sum(batch_draw_fracs) / len(batch_draw_fracs)
+                             if batch_draw_fracs else 0.0)
+            eff_expert_frac = (sum(expert_fracs) / len(expert_fracs)
+                               if expert_fracs else 0.0)
+            batch_material = self._batch_material(last_batch)
 
             avg = _average_stats(epoch_stats)
             logger.info(
@@ -618,6 +685,15 @@ class Trainer:
                 f"(lower = more decisive)"
             )
 
+            # Effective sampled-batch composition (advisor instrumentation):
+            # eff_draw verifies the max_draw_frac cap actually binds; mean
+            # material detects endgame skew from draw-filtering (full board=80).
+            logger.info(
+                f"[iter {it}] batch mix: eff_draw={100*eff_draw_frac:.1f}% "
+                f"eff_expert={100*eff_expert_frac:.1f}% "
+                f"mean_material={batch_material:.1f}"
+            )
+
             # Record a full metrics row for experiment analysis (CSV export).
             metrics_rows.append({
                 "iteration": it,
@@ -640,6 +716,9 @@ class Trainer:
                 "sims": cur_sims,
                 "selfplay_buffer": len(self.buffer),
                 "expert_buffer": len(self.buffer.expert) if self.buffer.expert else 0,
+                "eff_draw_frac": eff_draw_frac,
+                "eff_expert_frac": eff_expert_frac,
+                "batch_material": batch_material,
             })
 
             # Incrementally persist the experiment metrics CSV.

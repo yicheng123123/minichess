@@ -414,15 +414,18 @@ def _play_one_game_worker(args: dict) -> dict:
     global _WORKER_NET
     state_dict = args["state_dict"]
     net_kwargs = args["net_kwargs"]
+    device = args.get("device", "cpu")
     mcts_kwargs = args["mcts_kwargs"]
     game_seed = args["game_seed"]
     play_kwargs = args["play_kwargs"]
 
-    # Build the network once per worker process; afterwards just load the
-    # (iteration-updated) weights into the existing object.
+    # Build the network once per worker process ON THE TARGET DEVICE (GPU);
+    # afterwards just load the (iteration-updated) CPU weights into it. Building
+    # on the device is essential — a CPU network here makes self-play thousands of
+    # times slower (every MCTS evaluation runs on the CPU instead of the GPU).
     if _WORKER_NET is None:
         from nn.network import create_network
-        _WORKER_NET = create_network(**net_kwargs)
+        _WORKER_NET = create_network(**net_kwargs).to(device)
     _WORKER_NET.load_state_dict(state_dict)
     _WORKER_NET.eval()
 
@@ -514,12 +517,21 @@ def generate_games_parallel(
 
     # Prepare serializable args for workers.
     try:
-        state_dict = net.state_dict()
+        raw_state_dict = net.state_dict()
     except AttributeError:
         # RandomPolicyValueNet has no state_dict; fall back to serial.
         logger.info("Network has no state_dict; falling back to serial play.")
         serial_outcomes = generate_games(dataset, n_games, net, mcts, seed, augment, **kwargs)
         return serial_outcomes, [], [], []
+
+    # Detect the device the training net lives on, and ship the weights as CPU
+    # tensors. Each worker builds its own network on that device and loads the
+    # CPU weights there (avoids passing CUDA tensors across process boundaries).
+    try:
+        device = str(next(net.parameters()).device)
+    except StopIteration:
+        device = "cpu"
+    state_dict = {k: v.cpu() for k, v in raw_state_dict.items()}
 
     if net_kwargs is None:
         net_kwargs = {
@@ -543,6 +555,7 @@ def generate_games_parallel(
         tasks.append({
             "state_dict": state_dict,
             "net_kwargs": net_kwargs,
+            "device": device,
             "mcts_kwargs": mcts_kwargs,
             "game_seed": (seed + i) if seed is not None else None,
             "play_kwargs": kwargs,

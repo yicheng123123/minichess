@@ -110,24 +110,66 @@ def cmd_selfplay(args) -> int:
 
 
 def cmd_expert(args) -> int:
-    from selfplay.expert import generate_expert_games
-
-    outcomes = generate_expert_games(
-        n_games=args.games,
-        out_path=args.out,
-        depth_high=args.depth_high,
-        depth_low=args.depth_low,
-        max_plies=args.max_plies,
-        seed=args.seed,
-        augment=not args.no_augment,
-        random_opening_plies=args.opening_plies,
-        opponent=args.opponent,
-        epsilon=args.epsilon,
-        epsilon_jitter=args.epsilon_jitter,
-    )
+    if args.parallel:
+        from selfplay.expert import generate_expert_games_parallel
+        outcomes = generate_expert_games_parallel(
+            n_games=args.games,
+            out_path=args.out,
+            depth_high=args.depth_high,
+            depth_low=args.depth_low,
+            max_plies=args.max_plies,
+            seed=args.seed,
+            augment=not args.no_augment,
+            random_opening_plies=args.opening_plies,
+            opponent=args.opponent,
+            epsilon=args.epsilon,
+            num_workers=args.workers,
+        )
+    else:
+        from selfplay.expert import generate_expert_games
+        outcomes = generate_expert_games(
+            n_games=args.games,
+            out_path=args.out,
+            depth_high=args.depth_high,
+            depth_low=args.depth_low,
+            max_plies=args.max_plies,
+            seed=args.seed,
+            augment=not args.no_augment,
+            random_opening_plies=args.opening_plies,
+            opponent=args.opponent,
+            epsilon=args.epsilon,
+            epsilon_jitter=args.epsilon_jitter,
+        )
     decisive = sum(1 for o in outcomes if o != 0)
     print(f"generated {len(outcomes)} expert games ({decisive} decisive) -> {args.out}")
-    print(f"use them with: python main.py train --warm-start {args.out}")
+    print(f"use them with: python main.py supervise --data {args.out}")
+    return 0
+
+
+def cmd_supervise(args) -> int:
+    import torch
+    from nn.network import create_network
+    from train.supervised import supervised_pretrain
+    from utils.config import get_config
+
+    cfg = get_config()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = create_network(hidden=cfg.hidden_channels,
+                         num_res_blocks=cfg.num_res_blocks).to(device)
+    if args.init_model:
+        state = torch.load(args.init_model, map_location=device, weights_only=False)
+        net.load_state_dict(state)
+        print(f"[supervise] initialized from {args.init_model}")
+    result = supervised_pretrain(
+        net, args.data, epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, weight_decay=args.weight_decay, value_weight=args.value_weight,
+        val_fraction=args.val_fraction, save_path=args.out, device=device,
+        seed=args.seed,
+    )
+    print(f"supervised pretraining done: {result['n_samples']} positions, "
+          f"best val_acc={100 * result['best_val_acc']:.2f}% -> {args.out}")
+    print(f"start self-play from it with: python main.py train --warm-start-model "
+          f"{args.out} (or load it as the arena baseline)")
     return 0
 
 
@@ -185,6 +227,9 @@ def cmd_train(args) -> int:
         fresh_buffer=args.fresh_buffer,
         expert_replay=args.expert_replay,
         expert_ratio=args.expert_ratio,
+        freeze_buffer=args.freeze_buffer,
+        max_draw_frac=args.max_draw_frac,
+        init_model=args.init_model,
         resume=not args.no_resume,
     )
     return 0
@@ -365,6 +410,12 @@ def main() -> int:
     p_exp.add_argument("--epsilon-jitter", action="store_true",
                        help="with --opponent egreedy, draw each game's epsilon "
                             "from {0.1,0.2,0.3} instead of a fixed value")
+    p_exp.add_argument("--parallel", action="store_true",
+                       help="generate games in parallel across CPU cores "
+                            "(alpha-beta is CPU-bound; use for large datasets)")
+    p_exp.add_argument("--workers", type=int, default=None,
+                       help="number of parallel worker processes "
+                            "(default: min(cpu_count, 16))")
 
     # --- advantage (Tier-2 curriculum) ---
     p_adv = sub.add_parser("advantage",
@@ -389,6 +440,29 @@ def main() -> int:
     p_adv.add_argument("--advantage-threshold", type=float, default=2.0,
                        help="cut advantage phases when the winner's AB eval lead "
                             "reaches this (in soldier=1 units; default: 2.0)")
+
+    # --- supervise ---
+    p_sup = sub.add_parser("supervise",
+                           help="full supervised pretraining: imitate an AB "
+                                "teacher on every position (Phase 1 SL stage)")
+    p_sup.add_argument("--data", nargs="+", required=True,
+                       help="one or more expert JSONL files (combined)")
+    p_sup.add_argument("--epochs", type=int, default=10)
+    p_sup.add_argument("--batch-size", type=int, default=512)
+    p_sup.add_argument("--lr", type=float, default=1e-3)
+    p_sup.add_argument("--weight-decay", type=float, default=1e-4,
+                       help="L2 regularization coefficient (default: 1e-4) to "
+                            "counter overfitting on the imitation target")
+    p_sup.add_argument("--value-weight", type=float, default=1.0,
+                       help="weight on the value MSE relative to the policy CE")
+    p_sup.add_argument("--val-fraction", type=float, default=0.05,
+                       help="fraction of positions held out for validation accuracy")
+    p_sup.add_argument("--out", default="models/sl_net.pt",
+                       help="where to save the pretrained network")
+    p_sup.add_argument("--init-model", default=None,
+                       help="optional .pt checkpoint to initialize from (for DAgger "
+                            "fine-tuning instead of training from scratch)")
+    p_sup.add_argument("--seed", type=int, default=0)
 
     # --- train ---
     p_train = sub.add_parser("train", help="run the AlphaZero training loop")
@@ -438,6 +512,18 @@ def main() -> int:
     p_train.add_argument("--expert-ratio", type=float, default=0.25,
                          help="fraction of each training batch drawn from the "
                               "expert buffer (default: 0.25)")
+    p_train.add_argument("--freeze-buffer", action="store_true",
+                         help="ablation: after warm-start seeding, add NO new "
+                              "self-play data; train on the frozen buffer only "
+                              "(tests whether new self-play data is the poison)")
+    p_train.add_argument("--max-draw-frac", type=float, default=None,
+                         help="ablation (Replay Filtering): cap the fraction of "
+                              "draw samples per batch, labels unchanged "
+                              "(e.g. 0.2 keeps draws to <=20%% of each batch)")
+    p_train.add_argument("--init-model", default=None,
+                         help="path to a pretrained .pt state_dict (e.g. an SL net "
+                              "from `main.py supervise`) to initialize the network "
+                              "before self-play; use with --no-resume (Phase 2)")
 
     # --- api ---
     p_api = sub.add_parser("api", help="start the FastAPI server")
@@ -472,6 +558,7 @@ def main() -> int:
         "selfplay": cmd_selfplay,
         "expert": cmd_expert,
         "advantage": cmd_advantage,
+        "supervise": cmd_supervise,
         "train": cmd_train,
         "api": cmd_api,
         "viz": cmd_viz,

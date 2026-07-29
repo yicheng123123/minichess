@@ -66,7 +66,7 @@ class ReplayBuffer:
     # ------------------------------------------------------------------ #
     # Sampling
     # ------------------------------------------------------------------ #
-    def sample(self, batch_size: int) -> List[SelfPlaySample]:
+    def sample(self, batch_size: int, max_draw_frac: Optional[float] = None) -> List[SelfPlaySample]:
         """Return a uniformly random mini-batch of ``batch_size`` samples.
 
         If the buffer holds fewer than ``batch_size`` samples, all of them are
@@ -74,6 +74,10 @@ class ReplayBuffer:
 
         Args:
             batch_size: Desired number of samples.
+            max_draw_frac: Optional cap on the fraction of draw samples
+                (``value == 0``) in the batch — a Replay-Filtering ablation that
+                keeps labels unchanged (ground truth intact) and only reshapes
+                the sampled distribution. ``None`` (default) samples uniformly.
 
         Returns:
             A list of :class:`SelfPlaySample` of length
@@ -85,7 +89,20 @@ class ReplayBuffer:
         if n == 0:
             return []
         k = min(batch_size, n)
-        return random.sample(list(self._buffer), k)
+        if max_draw_frac is None:
+            return random.sample(list(self._buffer), k)
+        # Replay filtering: down-sample draws, fill the rest with decisive data.
+        decisive = [s for s in self._buffer if s.value != 0]
+        draws = [s for s in self._buffer if s.value == 0]
+        n_draw = min(len(draws), int(k * max_draw_frac))
+        n_dec = k - n_draw
+        batch: List[SelfPlaySample] = []
+        if decisive:
+            batch += random.sample(decisive, min(n_dec, len(decisive)))
+        if n_draw > 0 and draws:
+            batch += random.sample(draws, n_draw)
+        random.shuffle(batch)
+        return batch
 
     # ------------------------------------------------------------------ #
     # Bulk loading from a dataset
@@ -230,23 +247,27 @@ class DualReplayBuffer:
     # ------------------------------------------------------------------ #
     # Sampling
     # ------------------------------------------------------------------ #
-    def sample(self, batch_size: int, expert_ratio: float = 0.25):
+    def sample(self, batch_size: int, expert_ratio: float = 0.25,
+               max_draw_frac: Optional[float] = None):
         """Return ``(batch, sources)`` mixing expert and self-play samples.
 
         When an expert pool is loaded and ``expert_ratio`` > 0, a fixed fraction
         of the batch comes from the (decisive) expert pool and the remainder
         from the self-play pool. ``sources`` tags each sample's origin.
+        ``max_draw_frac`` (optional) caps the draw fraction within the self-play
+        portion (Replay-Filtering ablation; the expert pool is all decisive).
         """
         if self.expert is not None and len(self.expert) > 0 and expert_ratio > 0:
             n_expert = max(1, int(batch_size * expert_ratio))
             n_selfplay = batch_size - n_expert
             expert_part = self.expert.sample(n_expert)
-            selfplay_part = self.selfplay.sample(n_selfplay) if n_selfplay > 0 else []
+            selfplay_part = (self.selfplay.sample(n_selfplay, max_draw_frac=max_draw_frac)
+                             if n_selfplay > 0 else [])
             batch = expert_part + selfplay_part
             sources = (["expert"] * len(expert_part)
                        + ["selfplay"] * len(selfplay_part))
             return batch, sources
-        batch = self.selfplay.sample(batch_size)
+        batch = self.selfplay.sample(batch_size, max_draw_frac=max_draw_frac)
         return batch, ["selfplay"] * len(batch)
 
     # ------------------------------------------------------------------ #

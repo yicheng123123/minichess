@@ -274,6 +274,101 @@ def generate_expert_games(
     return outcomes
 
 
+def _play_expert_worker(task: dict):
+    """Process worker: play one expert game and return the (augmented) record.
+
+    Alpha-beta search is CPU-bound, so these workers scale across cores without
+    touching the GPU. Returns ``None`` for a game that produced no samples.
+    """
+    game = play_expert_game(
+        depth_high=task["depth_high"],
+        depth_low=task["depth_low"],
+        high_plays_red=task["high_plays_red"],
+        max_plies=task["max_plies"],
+        seed=task["seed"],
+        random_opening_plies=task["random_opening_plies"],
+        opponent=task["opponent"],
+        epsilon=task["epsilon"],
+    )
+    samples = game["samples"]
+    if not samples:
+        return None
+    if task.get("augment", True):
+        samples = samples + [_mirror_expert_sample(s) for s in samples]
+    return {"samples": samples, "outcome": game["outcome"],
+            "plies": game["plies"], "reason": game["reason"]}
+
+
+def generate_expert_games_parallel(
+    n_games: int,
+    out_path: str,
+    depth_high: int = 3,
+    depth_low: int = 3,
+    max_plies: int = 200,
+    seed: int = 0,
+    augment: bool = True,
+    random_opening_plies: int = 8,
+    opponent: str = "ab",
+    epsilon: float = 0.2,
+    num_workers: Optional[int] = None,
+) -> List[int]:
+    """Parallel version of :func:`generate_expert_games` for large SL datasets.
+
+    Fans ``n_games`` independent alpha-beta games out across a process pool
+    (alpha-beta is CPU-bound, so this scales nearly linearly with cores) and
+    appends each finished game to ``out_path`` in the same JSONL format. The
+    stronger side alternates color each game. Used to build the supervised
+    pretraining corpus (Phase 1 of the engineering route).
+
+    Returns:
+        List of game outcomes (+1 Red wins, -1 Black wins, 0 draw).
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    workers = num_workers or min(os.cpu_count() or 4, 16)
+
+    tasks = [{
+        "depth_high": depth_high, "depth_low": depth_low,
+        "high_plays_red": (i % 2 == 0), "max_plies": max_plies,
+        "seed": seed + i, "random_opening_plies": random_opening_plies,
+        "opponent": opponent, "epsilon": epsilon, "augment": augment,
+    } for i in range(n_games)]
+
+    logger.info(f"Generating {n_games} expert games on {workers} workers "
+                f"(d{depth_high}/d{depth_low}, opponent={opponent}, "
+                f"augment={augment}) ...")
+    outcomes: List[int] = []
+    reason_counts: dict = {}
+    total_samples = 0
+    done = 0
+    with open(out_path, "a", encoding="utf-8") as f, \
+            ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_play_expert_worker, t) for t in tasks]
+        for fut in as_completed(futs):
+            rec = fut.result()
+            done += 1
+            if rec is not None:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                outcomes.append(rec["outcome"])
+                reason_counts[rec["reason"]] = reason_counts.get(rec["reason"], 0) + 1
+                total_samples += len(rec["samples"])
+            if done % 50 == 0 or done == n_games:
+                logger.info(f"  expert progress: {done}/{n_games} games, "
+                            f"{total_samples} samples so far")
+
+    red = outcomes.count(1)
+    black = outcomes.count(-1)
+    draws = outcomes.count(0)
+    reason_summary = ", ".join(f"{k}={v}" for k, v in
+                               sorted(reason_counts.items(), key=lambda kv: -kv[1]))
+    logger.info(f"Generated {len(outcomes)} expert games ({red}R/{black}B/{draws}D) "
+                f"terminal[{reason_summary}] samples={total_samples} -> {out_path}")
+    return outcomes
+
+
 # --------------------------------------------------------------------------- #
 # Advantage Curriculum (Tier 2): teach the policy to CONVERT an advantage.
 # --------------------------------------------------------------------------- #
@@ -374,10 +469,13 @@ def play_advantage_game(
         adv = eval_red if winner is Color.RED else -eval_red
         if adv < advantage_threshold:
             continue                      # not yet in an advantage phase
-        if mover is not winner:
-            continue                      # only teach the converter's choices
+        # Keep BOTH sides' moves in the advantage phase so the value head sees
+        # +1 (winner to move) and -1 (loser to move) labels and learns to
+        # discriminate. The policy, however, imitates only the winner's forcing
+        # moves (teacher flag), so it learns to convert without imitating the
+        # loser or any quiet shuffling.
         value = float(outcome) if mover is Color.RED else float(-outcome)
-        teacher = forcing                 # policy learns only forcing moves
+        teacher = forcing and (mover is winner)
         if teacher:
             n_teacher += 1
         samples.append({
