@@ -100,8 +100,9 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
         if not moves:
             break
 
-        # --- AB labels the current position (always) ---
-        _score, ab_mv = alphabeta(board, depth=ab_depth)
+        # --- AB labels the current position (always use at least d2) ---
+        label_depth = max(ab_depth, 2)
+        _score, ab_mv = alphabeta(board, depth=label_depth)
         if ab_mv is None:
             ab_mv = moves[0]
 
@@ -148,8 +149,12 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
                 break
             board.make_move(student_mv)
         else:
-            # AB moves (the "environment" responds)
-            board.make_move(ab_mv)
+            # Opponent moves: random if depth==0, else AB
+            if ab_depth == 0:
+                import random as _rnd
+                board.make_move(_rnd.choice(moves))
+            else:
+                board.make_move(ab_mv)
         ply += 1
 
     # Determine outcome
@@ -215,24 +220,38 @@ def main():
     ap = argparse.ArgumentParser(description="DAgger data generation")
     ap.add_argument("--model", required=True, help="Current SL model path")
     ap.add_argument("--games", type=int, default=500)
-    ap.add_argument("--ab-depth", type=int, default=3)
+    ap.add_argument("--ab-depth", type=int, default=2,
+                    help="AB depth for opponent and labeling (ignored if --mix)")
+    ap.add_argument("--mix", action="store_true",
+                    help="Mixed opponents: 30%% d1, 30%% d2, 30%% d3, 10%% random")
     ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--out", default="data/expert/dagger_iter1.jsonl")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    import random as _random
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    _random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = create_network().to(device)
     st = torch.load(args.model, map_location=device, weights_only=False)
     net.load_state_dict(st)
     net.eval()
+
+    # Per-game depth schedule
+    if args.mix:
+        pool = [1] * 30 + [2] * 30 + [3] * 30 + [0] * 10
+        game_depths = [pool[i % len(pool)] for i in range(args.games)]
+        _random.shuffle(game_depths)
+        print(f"[dagger] MIX mode: d1=30% d2=30% d3=30% random=10%")
+    else:
+        game_depths = [args.ab_depth] * args.games
+
     print(f"[dagger] model loaded from {args.model} on {device}")
-    print(f"[dagger] generating {args.games} games, AB depth={args.ab_depth}, "
-          f"augment={not args.no_augment}")
+    print(f"[dagger] generating {args.games} games, augment={not args.no_augment}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     t0 = time.time()
@@ -240,10 +259,10 @@ def main():
 
     with open(args.out, "w", encoding="utf-8") as f:
         for gi in range(args.games):
-            # Alternate student color for balanced training
             student_color = Color.RED if gi % 2 == 0 else Color.BLACK
+            depth = game_depths[gi]
             record = play_one_dagger_game(
-                net, device, args.ab_depth, args.max_plies,
+                net, device, depth, args.max_plies,
                 augment=not args.no_augment,
                 student_color=student_color,
             )
