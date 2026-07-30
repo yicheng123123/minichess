@@ -14,11 +14,11 @@
 
 ```
 7  r c n k n c r
-6  . p p p p p .
+6  p . p p p . p 
 5  . . . . . . .
 4  . . . . . . .
 3  . . . . . . .
-2  . P P P P P .
+2  P   P P P   P 
 1  R C N K N C R
 ```
 
@@ -140,5 +140,4 @@ pip install fastapi uvicorn   # API（可选）
 最优模型：`models/sl_dagger1.pt.best`
 - val_acc 88.4%
 - greedy 执黑守和 AB-d2/d3（10/10）
-- 执红仍输，vs d1 全输（风格过拟合）
 - 下一步：混合教师 DAgger 迭代，获取赢棋样本
