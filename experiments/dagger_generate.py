@@ -203,6 +203,8 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
         "reason": reason,
         "takeover_count": takeover_count,
         "position_count": position_count,
+        "opponent_depth": ab_depth,
+        "student_color": "red" if student_color == Color.RED else "black",
     }
 
 
@@ -232,10 +234,9 @@ def main():
                     help="AB depth for opponent and labeling (ignored if --mix)")
     ap.add_argument("--mix", action="store_true",
                     help="Mixed opponents: 20%% random, 30%% d1, 30%% d2, 20%% d3")
-    ap.add_argument("--max-draw-frac", type=float, default=0.3,
-                    help="Max fraction of draw games to keep (default 0.3)")
     ap.add_argument("--max-plies", type=int, default=200)
-    ap.add_argument("--out", default="data/expert/dagger_iter1.jsonl")
+    ap.add_argument("--out", default="data/expert/dagger_pool.jsonl",
+                    help="Output pool file (ALL games; filter later for ablations)")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -262,19 +263,16 @@ def main():
         game_depths = [args.ab_depth] * args.games
 
     print(f"[dagger] model: {args.model} on {device}")
-    print(f"[dagger] games={args.games}, max_draw_frac={args.max_draw_frac}, "
-          f"augment={not args.no_augment}")
+    print(f"[dagger] games={args.games}, augment={not args.no_augment}")
+    print(f"[dagger] writing ALL games to pool; use filter_dataset.py for ablations")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     t0 = time.time()
     n_samples = 0
-    n_written = 0
-    n_draws_skipped = 0
-    n_decisive = 0
-    n_draw = 0
-    n_student_wins = 0
     takeover_total = 0
     takeover_positions = 0
+    # Per-depth breakdown: depth -> [student_win, student_loss, draw]
+    depth_stats: dict = {}
 
     with open(args.out, "w", encoding="utf-8") as f:
         for gi in range(args.games):
@@ -286,50 +284,47 @@ def main():
                 student_color=student_color,
             )
 
-            # Track takeover rate
             takeover_total += record.get("takeover_count", 0)
             takeover_positions += record.get("position_count", 0)
 
-            # Outcome stats
-            is_draw = (record["outcome"] == 0.0 and record["reason"] != "max_plies")
-            is_maxplies = (record["reason"] == "max_plies")
-            if is_draw or is_maxplies:
-                n_draw += 1
-                # Filter draws beyond max fraction
-                if n_written > 0 and n_draw / max(n_written, 1) > args.max_draw_frac:
-                    n_draws_skipped += 1
-                    continue
+            # Classify outcome from student's perspective
+            outcome = record["outcome"]
+            if student_color == Color.BLACK:
+                outcome = -outcome
+            stats = depth_stats.setdefault(depth, [0, 0, 0])
+            if record["reason"] in ("repetition", "stalemate", "max_plies") or outcome == 0:
+                stats[2] += 1  # draw
+            elif outcome > 0:
+                stats[0] += 1  # student win
             else:
-                n_decisive += 1
-                # Did student win?
-                if student_color == Color.RED and record["outcome"] > 0:
-                    n_student_wins += 1
-                elif student_color == Color.BLACK and record["outcome"] < 0:
-                    n_student_wins += 1
+                stats[1] += 1  # student loss
 
             f.write(json.dumps(record) + "\n")
             f.flush()
-            n_written += 1
             n_samples += len(record["samples"])
 
             if (gi + 1) % 50 == 0:
                 elapsed = time.time() - t0
                 rate = (gi + 1) / elapsed * 60
                 tk = takeover_total / max(takeover_positions, 1) * 100
-                print(f"  [{gi+1}/{args.games}] written={n_written} "
-                      f"samples={n_samples} takeover={tk:.0f}% "
-                      f"rate={rate:.1f}/min")
+                print(f"  [{gi+1}/{args.games}] samples={n_samples} "
+                      f"takeover={tk:.0f}% rate={rate:.1f}/min")
 
     elapsed = time.time() - t0
     tk_rate = takeover_total / max(takeover_positions, 1) * 100
+    tot_w = sum(s[0] for s in depth_stats.values())
+    tot_l = sum(s[1] for s in depth_stats.values())
+    tot_d = sum(s[2] for s in depth_stats.values())
     print(f"\n[dagger] done in {elapsed:.0f}s -> {args.out}")
-    print(f"  games played={args.games}, written={n_written}, "
-          f"draws_skipped={n_draws_skipped}")
-    print(f"  decisive={n_decisive}, draw={n_draw}, "
-          f"student_wins={n_student_wins}")
+    print(f"  games={args.games} | student W={tot_w} L={tot_l} D={tot_d}")
     print(f"  AB takeover rate={tk_rate:.1f}% "
           f"({takeover_total}/{takeover_positions} positions)")
     print(f"  samples={n_samples}")
+    print(f"  per-opponent breakdown (student W/L/D):")
+    for depth in sorted(depth_stats):
+        name = "random" if depth == 0 else f"d{depth}"
+        w, l, d = depth_stats[depth]
+        print(f"    vs {name:<6} W={w:3d} L={l:3d} D={d:3d}")
 
 
 if __name__ == "__main__":
