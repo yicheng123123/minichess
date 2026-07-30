@@ -71,18 +71,24 @@ def mirror_move_str(move_str: str) -> str:
 
 
 def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
-                         student_color=None):
+                         student_color=None, disagreement_only=False):
     """Play one DAgger game: student plays one side, AB plays the other.
 
-    The student's moves determine the trajectory on its turn; AB responds on
-    the other turn (acting as the "environment"). Labels (AB best move) are
-    recorded at EVERY position so the model learns correct play for both
-    sides from positions it actually encounters during real play.
+    The student's greedy move determines the trajectory on its turn; AB
+    responds on the other turn (acting as the "environment").
+
+    If ``disagreement_only`` is True (the original DAgger paper's recipe), a
+    training sample is recorded ONLY at positions where the student's greedy
+    move differs from AB's best move — these are exactly the states the
+    student gets wrong and needs to learn. Agreement positions carry no
+    learning signal and are dropped, yielding a small, high-value dataset.
 
     Parameters
     ----------
     student_color : Color or None
         Which side the student plays. If None, defaults to RED.
+    disagreement_only : bool
+        If True, keep only student!=teacher positions.
     """
     if student_color is None:
         student_color = Color.RED
@@ -91,7 +97,7 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
     samples = []
     ply = 0
     takeover_count = 0  # positions where student != AB
-    position_count = 0  # total student-turn positions
+    position_count = 0  # total positions evaluated
 
     while ply < max_plies:
         result = game_result(board)
@@ -102,60 +108,59 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
         if not moves:
             break
 
+        mover = board.side_to_move
+
         # --- AB labels the current position (always use at least d2) ---
         label_depth = max(ab_depth, 2)
         _score, ab_mv = alphabeta(board, depth=label_depth)
         if ab_mv is None:
             ab_mv = moves[0]
 
-        # Build one-hot policy target for AB's move
-        ab_idx = move_to_index(ab_mv)
-        policy_onehot = [0.0] * 2401
-        policy_onehot[ab_idx] = 1.0
+        # --- Student's greedy move at this position (for trajectory + check) ---
+        student_mv, _ = greedy_move(board, net, device)
+        if student_mv is None:
+            student_mv = ab_mv
+        disagrees = (student_mv != ab_mv)
 
-        # Planes
-        planes = board.to_planes()  # numpy (C, 7, 7)
+        position_count += 1
+        if disagrees:
+            takeover_count += 1
 
-        # Record sample (value filled later)
-        sample = {
-            "planes": encode_planes(planes),
-            "policy": policy_onehot,
-            "value": 0.0,  # placeholder
-            "move": str(ab_mv),
-            "teacher": True,
-        }
-        samples.append(sample)
+        # --- Record sample (only on disagreement if disagreement_only) ---
+        if (not disagreement_only) or disagrees:
+            ab_idx = move_to_index(ab_mv)
+            policy_onehot = [0.0] * 2401
+            policy_onehot[ab_idx] = 1.0
+            planes = board.to_planes()  # numpy (C, 7, 7)
+            samples.append({
+                "planes": encode_planes(planes),
+                "policy": policy_onehot,
+                "value": 0.0,  # filled later
+                "move": str(ab_mv),
+                "teacher": True,
+                "_mover_red": mover == Color.RED,
+            })
+            # Mirror augmentation
+            if augment:
+                m_planes = mirror_planes(planes)
+                m_move = mirror_move_str(str(ab_mv))
+                m_idx = move_to_index_from_str(m_move)
+                if m_idx is not None:
+                    m_policy = [0.0] * 2401
+                    m_policy[m_idx] = 1.0
+                    samples.append({
+                        "planes": encode_planes(m_planes),
+                        "policy": m_policy,
+                        "value": 0.0,
+                        "move": m_move,
+                        "teacher": True,
+                        "_mover_red": mover == Color.RED,
+                    })
 
-        # Mirror augmentation
-        if augment:
-            m_planes = mirror_planes(planes)
-            m_move = mirror_move_str(str(ab_mv))
-            m_idx = move_to_index_from_str(m_move)
-            if m_idx is not None:
-                m_policy = [0.0] * 2401
-                m_policy[m_idx] = 1.0
-                samples.append({
-                    "planes": encode_planes(m_planes),
-                    "policy": m_policy,
-                    "value": 0.0,
-                    "move": m_move,
-                    "teacher": True,
-                })
-
-        # --- Determine who moves ---
-        mover = board.side_to_move
+        # --- Advance the board: student acts on its turn, else opponent ---
         if mover == student_color:
-            # Student moves (determines on-policy trajectory)
-            student_mv, _ = greedy_move(board, net, device)
-            if student_mv is None:
-                break
-            # Track takeover: does student agree with AB?
-            position_count += 1
-            if student_mv != ab_mv:
-                takeover_count += 1
             board.make_move(student_mv)
         else:
-            # Opponent moves: random if depth==0, else AB
             if ab_depth == 0:
                 import random as _rnd
                 board.make_move(_rnd.choice(moves))
@@ -178,23 +183,9 @@ def play_one_dagger_game(net, device, ab_depth, max_plies=200, augment=True,
         else:
             outcome_val = 0.0
 
-    # Fill value for each sample: outcome from mover's perspective
-    # Sample i was at ply i (before mirror doubling). Mover alternates.
-    # With augmentation, pairs are (original, mirror) at same ply.
-    idx = 0
-    for p in range(ply):
-        # mover at ply p: RED if p even, BLACK if p odd
-        # outcome_val is red-positive: +1 = red wins
-        if p % 2 == 0:  # RED to move
-            val = outcome_val
-        else:  # BLACK to move
-            val = -outcome_val
-        if idx < len(samples):
-            samples[idx]["value"] = val
-            idx += 1
-        if augment and idx < len(samples):
-            samples[idx]["value"] = val
-            idx += 1
+    # Fill value per sample from the mover's perspective (outcome is red-positive)
+    for s in samples:
+        s["value"] = outcome_val if s.pop("_mover_red") else -outcome_val
 
     return {
         "samples": samples,
@@ -234,6 +225,8 @@ def main():
                     help="AB depth for opponent and labeling (ignored if --mix)")
     ap.add_argument("--mix", action="store_true",
                     help="Mixed opponents: 20%% random, 30%% d1, 30%% d2, 20%% d3")
+    ap.add_argument("--disagreement-only", action="store_true",
+                    help="Only keep positions where student != teacher (true DAgger)")
     ap.add_argument("--max-plies", type=int, default=200)
     ap.add_argument("--out", default="data/expert/dagger_pool.jsonl",
                     help="Output pool file (ALL games; filter later for ablations)")
@@ -263,8 +256,8 @@ def main():
         game_depths = [args.ab_depth] * args.games
 
     print(f"[dagger] model: {args.model} on {device}")
-    print(f"[dagger] games={args.games}, augment={not args.no_augment}")
-    print(f"[dagger] writing ALL games to pool; use filter_dataset.py for ablations")
+    print(f"[dagger] games={args.games}, augment={not args.no_augment}, "
+          f"disagreement_only={args.disagreement_only}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     t0 = time.time()
@@ -282,6 +275,7 @@ def main():
                 net, device, depth, args.max_plies,
                 augment=not args.no_augment,
                 student_color=student_color,
+                disagreement_only=args.disagreement_only,
             )
 
             takeover_total += record.get("takeover_count", 0)
